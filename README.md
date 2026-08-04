@@ -236,7 +236,7 @@ Model training code is maintained in the companion repository **[NathanWu7/Taber
 | `Isaac-Libero-Franka-Replay-Camera-ContactForce-v0` | Replay with contact-force observations |
 | `Isaac-Libero-Franka-Hybrid-ContactForce-v0` | Hybrid force-position control with contact force |
 | `Isaac-Libero-Franka-Replay-Camera-Tactile-v0` | Replay with GelSight tactile sensors |
-| `Isaac-Libero-Franka-Hybrid-Tactile-v0` | Hybrid tactile environment |
+| `Isaac-Libero-Franka-Hybrid-Tactile-v0` | Hybrid force-position control with tactile |
 
 ---
 
