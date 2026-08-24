@@ -4,14 +4,15 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 
+from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
+from isaaclab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsActionCfg
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import FrameTransformerCfg
 from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
 from isaaclab.utils import configclass
-from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
-from isaaclab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsActionCfg
+
 from tac_manip.core.sensors import GripperContactSensorCfg
 from tac_manip.tasks.manipulation.libero import mdp
 
@@ -40,6 +41,24 @@ HYBRID_FORCE_HISTORY_LENGTH = 8
 #   we only record the *current* frame to keep datasets clean and lightweight.
 # - Any force-history window (e.g., H=8) should be constructed in offline conversion scripts.
 RECORD_FORCE_HISTORY_LENGTH = 1
+
+
+def _configure_target_contact_squeeze_override(action_cfg, libero_config) -> None:
+    """Copy the validated per-task override into a ForcePositionAction config."""
+
+    override = libero_config.target_contact_squeeze_override
+    if override is None:
+        return
+    action_cfg.target_contact_squeeze_enabled = True
+    action_cfg.target_contact_object_name = override.target_object
+    action_cfg.target_contact_sensor_name = (
+        f"contact_target_squeeze_{override.target_object}"
+    )
+    action_cfg.target_contact_single_finger_normal_force_n = (
+        override.single_finger_normal_force_n
+    )
+    action_cfg.target_contact_threshold_n = override.contact_threshold_n
+    action_cfg.target_contact_activation = override.activation
 
 
 ##
@@ -263,6 +282,9 @@ class ForcePositionLiberoCameraEnvCfg(JointPositionLiberoCameraEnvCfg):
             pos_kp=(-0.0001, -0.0001, -0.0001), #-0.0001
             squeeze_kp=0.0002,
         )
+        _configure_target_contact_squeeze_override(
+            self.actions.arm_action, self.libero_config
+        )
 
         # 明确告知 ActionManager 使用 ForcePositionAction 这个实现类
         self.actions.arm_action.class_type = mdp.ForcePositionAction
@@ -427,6 +449,9 @@ class ForcePositionTactileLiberoCameraEnvCfg(JointPositionTactileLiberoCameraEnv
             # pos_kp=(0.0, 0.0, 0.0),
             # squeeze_kp=0.0
         )
+        _configure_target_contact_squeeze_override(
+            self.actions.arm_action, self.libero_config
+        )
 
         # 显式指定 Action 类型，并禁用旧的 gripper_action 以避免冲突
         self.actions.arm_action.class_type = mdp.ForcePositionAction
@@ -454,7 +479,8 @@ class ForcePositionTactileLiberoCameraEnvCfg(JointPositionTactileLiberoCameraEnv
         # NOTE: PhysX GPU attributes FixedJoint child body (gelpad) contact forces to the
         # parent articulation link (finger). Bind to finger to get correct force readings.
         self.scene.contact_gripper = GripperContactSensorCfg(
-            prim_path="{ENV_REGEX_NS}/Robot/gelsight_mini_case_.*",
+            # prim_path="{ENV_REGEX_NS}/Robot/gelsight_mini_case_.*",
+            prim_path="{ENV_REGEX_NS}/Robot/panda_.*finger",
             update_period=0.0,
             history_length=RECORD_FORCE_HISTORY_LENGTH,
             debug_vis=False,
@@ -530,7 +556,7 @@ class IKTactileLiberoCameraEnvCfg(IKLiberoCameraEnvCfg):
             debug_vis=False,  # visualizer for frame transformer
             visualizer_cfg=self.tactile_marker_1_cfg,
         )
-        
+
         # Add contact force sensor for gripper fingers.
         # NOTE: PhysX GPU attributes FixedJoint child body (gelpad) contact forces to the
         # parent articulation link (finger). Bind to finger to get correct force readings.
@@ -545,7 +571,7 @@ class IKTactileLiberoCameraEnvCfg(IKLiberoCameraEnvCfg):
             left_finger_offset=OffsetCfg(pos=(0.0, 0.0, 0.045), rot=(0.5, 0.5, 0.5, -0.5)),
             right_finger_offset=OffsetCfg(pos=(0.0, 0.0, 0.045), rot=(0.5, -0.5, 0.5, 0.5)),
         )
-        
+
         # IMPORTANT: Override ee_frame offset for tactile sensor robot
         # Tactile sensor robot has different physical structure
         # Use standard Franka offset (0.107m) for tactile environment

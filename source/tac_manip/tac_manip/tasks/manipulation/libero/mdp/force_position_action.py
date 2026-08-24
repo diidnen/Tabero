@@ -1,25 +1,25 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import MISSING
 from typing import TYPE_CHECKING
 
-import torch
 import isaaclab.utils.math as math_utils
-from isaaclab.managers.action_manager import ActionTerm, ActionTermCfg
-from isaaclab.utils import configclass
-
+import torch
 from isaaclab.envs.mdp.actions.actions_cfg import (
     DifferentialInverseKinematicsActionCfg,
 )
 from isaaclab.envs.mdp.actions.task_space_actions import (
     DifferentialInverseKinematicsAction,
 )
+from isaaclab.managers.action_manager import ActionTerm, ActionTermCfg
+from isaaclab.utils import configclass
 
 from .observations import contact_force_in_gripper_frame
 
 if TYPE_CHECKING:
-    from isaaclab.envs import ManagerBasedRLEnv
     from isaaclab.assets import Articulation
+    from isaaclab.envs import ManagerBasedRLEnv
     from isaaclab.sensors import FrameTransformer
 
 
@@ -58,6 +58,15 @@ class ForcePositionActionCfg(ActionTermCfg):
     right_gripper_frame_name: str = "right_gripper_frame"
     contact_sensor_name: str = "contact_gripper"
     history_length: int = 1
+
+    # Optional JSON-configured fixed squeeze target.  Missing/disabled values
+    # preserve the original policy-driven force behavior exactly.
+    target_contact_squeeze_enabled: bool = False
+    target_contact_sensor_name: str = ""
+    target_contact_object_name: str = ""
+    target_contact_single_finger_normal_force_n: float = 0.0
+    target_contact_threshold_n: float = 0.0
+    target_contact_activation: str = "first_contact_latched"
 
     # 增益
     # 位置混合增益：可以是标量，表示 xyz 共用一个 K，也可以是 (kx, ky, kz)
@@ -125,6 +134,36 @@ class ForcePositionAction(ActionTerm):
             and env.scene[cfg.contact_sensor_name] is not None
             else None
         )
+        self._target_contact_sensor = None
+        if cfg.target_contact_squeeze_enabled:
+            if cfg.target_contact_activation != "first_contact_latched":
+                raise ValueError(
+                    "[ForcePositionAction] unsupported target-contact activation "
+                    f"mode: {cfg.target_contact_activation!r}."
+                )
+            if cfg.target_contact_single_finger_normal_force_n <= 0.0:
+                raise ValueError(
+                    "[ForcePositionAction] target-contact single-finger force "
+                    "must be positive."
+                )
+            if cfg.target_contact_threshold_n < 0.0:
+                raise ValueError(
+                    "[ForcePositionAction] target-contact threshold must be "
+                    "non-negative."
+                )
+            if not cfg.target_contact_sensor_name:
+                raise ValueError(
+                    "[ForcePositionAction] target-contact sensor name is required "
+                    "when the squeeze override is enabled."
+                )
+            if cfg.target_contact_sensor_name not in env.scene.keys():
+                raise RuntimeError(
+                    "[ForcePositionAction] target-contact sensor "
+                    f"{cfg.target_contact_sensor_name!r} is missing from the scene."
+                )
+            self._target_contact_sensor = env.scene[
+                cfg.target_contact_sensor_name
+            ]
 
         # 解析夹爪关节（平行夹爪，两个 finger）
         if not hasattr(env.cfg, "gripper_joint_names"):
@@ -154,6 +193,25 @@ class ForcePositionAction(ActionTerm):
         # 实测挤压力 EMA 滤波状态（标量）
         self._f_sq_meas_ema = torch.zeros(self.num_envs, device=self._device)
         self._f_sq_meas_ema_initialized = False
+
+        # Per-environment state for the first-contact latch.  The step counter
+        # advances in process_actions(), which is called once per environment
+        # step (rather than once per decimated simulation step).
+        self._target_contact_detected = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self._device
+        )
+        self._target_contact_latched = torch.zeros_like(
+            self._target_contact_detected
+        )
+        self._target_contact_force_norm = torch.zeros(
+            self.num_envs, device=self._device
+        )
+        self._target_contact_activation_step = torch.full(
+            (self.num_envs,), -1, dtype=torch.long, device=self._device
+        )
+        self._environment_step_count = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self._device
+        )
 
         # 调试信息缓存（仅用于可视化，不影响控制逻辑）
         self._debug: dict[str, torch.Tensor] = {}
@@ -195,6 +253,26 @@ class ForcePositionAction(ActionTerm):
     def last_d_cmd(self) -> torch.Tensor:
         """最近一次计算得到的夹爪目标开合度 d_cmd（每 env 一个标量）."""
         return self._last_d_cmd
+
+    def reset(self, env_ids: Sequence[int] | slice | torch.Tensor | None = None) -> None:
+        """Reset actions, filters, and target-contact latch state."""
+
+        ids = slice(None) if env_ids is None else env_ids
+        self._ik_term.reset(env_ids=ids)
+        self._raw_actions[ids] = 0.0
+        self._processed_actions[ids] = 0.0
+        self._f_sq_meas_ema[ids] = 0.0
+        # EMA initialization is currently shared by all environments; forcing
+        # reinitialization is safe for partial resets and avoids stale force.
+        self._f_sq_meas_ema_initialized = False
+        self._target_contact_detected[ids] = False
+        self._target_contact_latched[ids] = False
+        self._target_contact_force_norm[ids] = 0.0
+        self._target_contact_activation_step[ids] = -1
+        self._environment_step_count[ids] = 0
+        if self._target_contact_sensor is not None:
+            self._target_contact_sensor.reset(ids)
+        self._debug = {}
 
     # --------------------------------------------------------------------- #
     # Helpers
@@ -261,6 +339,49 @@ class ForcePositionAction(ActionTerm):
         self._raw_actions[:] = actions
         self._processed_actions[:] = actions
 
+        if self.cfg.target_contact_squeeze_enabled:
+            force_matrix_w = self._target_contact_sensor.data.force_matrix_w
+            if force_matrix_w is None:
+                raise RuntimeError(
+                    "[ForcePositionAction] target-contact sensor has no "
+                    "force_matrix_w; finger filter prims are required."
+                )
+            if force_matrix_w.ndim != 4 or force_matrix_w.shape[-1] != 3:
+                raise RuntimeError(
+                    "[ForcePositionAction] target-contact sensor must provide "
+                    f"(N,B,M,3) force_matrix_w, got {tuple(force_matrix_w.shape)}."
+                )
+            if force_matrix_w.shape[0] != self.num_envs:
+                raise RuntimeError(
+                    "[ForcePositionAction] target-contact sensor environment "
+                    f"count mismatch: expected {self.num_envs}, got "
+                    f"{force_matrix_w.shape[0]}."
+                )
+            contact_norm = torch.linalg.vector_norm(force_matrix_w, dim=-1)
+            contact_norm = contact_norm.amax(dim=(1, 2))
+            if not torch.all(torch.isfinite(contact_norm)):
+                raise RuntimeError(
+                    "[ForcePositionAction] target-contact sensor produced "
+                    "non-finite force values."
+                )
+            detected = contact_norm >= float(
+                self.cfg.target_contact_threshold_n
+            )
+            # PhysX can expose the previous episode's final contact view until
+            # one post-reset simulation step has completed.  The Task 0 reset
+            # starts with the gripper away from the object, so arm the gate only
+            # after that first refresh to prevent a stale step-0 latch.
+            detected &= self._environment_step_count > 0
+            newly_latched = detected & ~self._target_contact_latched
+            self._target_contact_activation_step[newly_latched] = (
+                self._environment_step_count[newly_latched]
+            )
+            self._target_contact_detected[:] = detected
+            self._target_contact_latched.logical_or_(detected)
+            self._target_contact_force_norm[:] = contact_norm
+
+        self._environment_step_count.add_(1)
+
         # 0:3 -> 位置, 3:6 -> 轴角, 6:7 -> gripper, 7:10/10:13 -> 左/右指目标力
         self._eef_pos_cmd[:] = actions[:, 0:3]
         self._eef_aa_cmd[:] = actions[:, 3:6]
@@ -321,6 +442,24 @@ class ForcePositionAction(ActionTerm):
                 enable_ff = torch.ones_like(f_sq_meas_raw, dtype=torch.bool)
             ff = float(self.cfg.squeeze_ff_k_load_z) * torch.abs(f_sq_target)
             f_sq_target_eff = torch.where(enable_ff, f_sq_target + ff, f_sq_target)
+
+        # Apply the fixed target after feed-forward compensation so a configured
+        # 13 N per finger remains exactly 26 N in the controller's two-finger
+        # squeeze convention.  The policy's x/y and net applied-force targets
+        # remain untouched.
+        if self.cfg.target_contact_squeeze_enabled:
+            override_target = torch.full_like(
+                f_sq_target_eff,
+                2.0
+                * float(
+                    self.cfg.target_contact_single_finger_normal_force_n
+                ),
+            )
+            f_sq_target_eff = torch.where(
+                self._target_contact_latched,
+                override_target,
+                f_sq_target_eff,
+            )
 
         # ------------------------------
         # 3) 「加持力」从 finger 局部系 -> 世界 -> base（用于位置外环混合）
@@ -426,6 +565,7 @@ class ForcePositionAction(ActionTerm):
             d_meas = d_meas_two.mean(dim=-1)  # (N,)
         except Exception:
             d_meas = self._last_d_cmd.detach().clone()
+            d_meas_two = torch.stack([d_meas, d_meas], dim=-1)
 
         self._debug = {
             "fL_pred_local": self._fL_target_local.detach().clone(),
@@ -446,9 +586,38 @@ class ForcePositionAction(ActionTerm):
             "f_sq_meas": f_sq_meas.detach().clone(),
             "f_sq_meas_raw": f_sq_meas_raw.detach().clone(),
             "f_sq_pred_eff": f_sq_target_eff.detach().clone(),
+            "target_contact_override_enabled": torch.full_like(
+                self._target_contact_detected,
+                self.cfg.target_contact_squeeze_enabled,
+            ),
+            "target_contact_detected": self._target_contact_detected.detach().clone(),
+            "target_contact_force_norm": self._target_contact_force_norm.detach().clone(),
+            "target_contact_override_latched": self._target_contact_latched.detach().clone(),
+            "target_contact_activation_step": self._target_contact_activation_step.detach().clone(),
+            "target_contact_configured_single_finger_force": torch.full_like(
+                f_sq_target_eff,
+                float(
+                    self.cfg.target_contact_single_finger_normal_force_n
+                ),
+            ),
+            "target_contact_configured_squeeze_force": torch.full_like(
+                f_sq_target_eff,
+                2.0
+                * float(
+                    self.cfg.target_contact_single_finger_normal_force_n
+                ),
+            ),
+            "target_contact_single_finger_target": (
+                0.5 * f_sq_target_eff
+            ).detach().clone(),
+            "target_contact_squeeze_target": f_sq_target_eff.detach().clone(),
             "d_pred": d_pred.detach().clone(),
             # 保持字段名兼容 force_position_debug_viz.py：d_actual 现在是“实测关节位置”
             "d_actual": d_meas.detach().clone(),
+            # 保留左右原始关节位置，避免把带符号变换的 policy observation
+            # 误当成夹爪行程；两者的均值严格等于 d_actual。
+            "d_actual_left": d_meas_two[:, 0].detach().clone(),
+            "d_actual_right": d_meas_two[:, 1].detach().clone(),
             # 额外提供控制器下发的目标开合度，便于对比
             "d_cmd": self._last_d_cmd.detach().clone(),
             "eef_pos_pred": self._eef_pos_cmd.detach().clone(),

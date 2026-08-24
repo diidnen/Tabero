@@ -1,0 +1,33 @@
+{
+  "schema_version": 2,
+  "profile": "alltask_damage_uniform_mass_05_16_friction_04_08_from_rlinf_sft_20k",
+  "source_profile": "firm_damage_fixed_friction_05_from_rlinf_sft_20k",
+  "active_derivation": {
+    "mode": "mass_friction",
+    "formula": "mass_kg * gravity_m_s2 / ((gripper_static_friction + object_static_friction) / 2) * tolerance_factor",
+    "tolerance_factor": 1.1,
+    "consecutive_frames": 4,
+    "calculation_time": "after reset-time mass and friction events",
+    "mass_source": "uniform [0.5, 1.6] kg sampled on every reset for every Task 0-9 target",
+    "friction_source": "reset-time Tabero physics_friction snapshots",
+    "gravity_source": "magnitude of the active IsaacLab simulation gravity vector"
+  },
+  "tasks": {
+    "0": {"object": "alphabet_soup_1", "mass_source": "uniform [0.5, 1.6] kg on reset"},
+    "1": {"object": "cream_cheese_1", "mass_source": "uniform [0.5, 1.6] kg on reset"},
+    "2": {"object": "salad_dressing_1", "mass_source": "uniform [0.5, 1.6] kg on reset"},
+    "3": {"object": "bbq_sauce_1", "mass_source": "uniform [0.5, 1.6] kg on reset"},
+    "4": {"object": "ketchup_1", "mass_source": "uniform [0.5, 1.6] kg on reset"},
+    "5": {"object": "tomato_sauce_1", "mass_source": "uniform [0.5, 1.6] kg on reset"},
+    "6": {"object": "butter_1", "mass_source": "uniform [0.5, 1.6] kg on reset"},
+    "7": {"object": "milk_1", "mass_source": "uniform [0.5, 1.6] kg on reset"},
+    "8": {"object": "chocolate_pudding_1", "mass_source": "uniform [0.5, 1.6] kg on reset"},
+    "9": {"object": "orange_juice_1", "mass_source": "uniform [0.5, 1.6] kg on reset"}
+  },
+  "historical_manual_thresholds": {
+    "source": "firm_damage_fixed_friction_05_from_rlinf_sft_20k/threshold_provenance.json",
+    "status": "not used by this profile",
+    "task_4_note": "Task 4 had no manual damage threshold in the source profile."
+  },
+  "formal_physical_damage_calibration": false
+}

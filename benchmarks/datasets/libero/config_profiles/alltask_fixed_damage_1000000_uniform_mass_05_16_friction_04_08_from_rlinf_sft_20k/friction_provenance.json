@@ -1,0 +1,25 @@
+{
+  "profile": "alltask_fixed_damage_1000000_uniform_mass_05_16_friction_04_08_from_rlinf_sft_20k",
+  "source_profile": "alltask_damage_uniform_mass_05_16_friction_04_08_from_rlinf_sft_20k",
+  "purpose": "Preserve the dynamic-damage profile's common reset-time target-object friction distribution for a fixed-high-damage-threshold ablation.",
+  "task_ids": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+  "gripper": {
+    "static_friction": 0.5,
+    "dynamic_friction": 0.5,
+    "scope": ["panda_leftfinger", "panda_rightfinger"],
+    "apply_on": "startup"
+  },
+  "objects": {
+    "scope": "obj_of_interest for every Task 0-9",
+    "distribution": "uniform",
+    "static_range": [0.4, 0.8],
+    "dynamic_range": [0.3, 0.6],
+    "apply_on": "reset",
+    "num_buckets": 64
+  },
+  "notes": [
+    "Each target object's collision shapes share one sampled material bucket per environment reset.",
+    "Task 4 remains included with the same randomized physics as the source profile.",
+    "The ranges define experimental domain randomization rather than object-specific physical calibration."
+  ]
+}

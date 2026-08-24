@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "source_report": "Record/experiments/2026-08-06_23-29-10-task0-3_5-9-firm-rlinf_sft_2gpu_mb16-20k.md",
+  "source_metric": "squeeze_max_meas",
+  "source_metric_semantics": "task mean across successful episodes of per-episode Top-5%-sample mean over non-zero measured squeeze",
+  "derivation": "exact source value, no additional margin or rounding",
+  "consecutive_frames": 4,
+  "tasks": {
+    "0": {"object": "alphabet_soup_1", "max_squeeze_force": 73.7260},
+    "1": {"object": "cream_cheese_1", "max_squeeze_force": 47.1633},
+    "2": {"object": "salad_dressing_1", "max_squeeze_force": 16.4627},
+    "3": {"object": "bbq_sauce_1", "max_squeeze_force": 13.8459},
+    "5": {"object": "tomato_sauce_1", "max_squeeze_force": 54.0869},
+    "6": {"object": "butter_1", "max_squeeze_force": 38.1775},
+    "7": {"object": "milk_1", "max_squeeze_force": 48.9534},
+    "8": {"object": "chocolate_pudding_1", "max_squeeze_force": 58.0237},
+    "9": {"object": "orange_juice_1", "max_squeeze_force": 35.3483}
+  },
+  "task5_mass": {
+    "object": "tomato_sauce_1",
+    "distribution": "uniform",
+    "range_kg": [0.08, 0.12],
+    "apply_on": "reset"
+  },
+  "formal_physical_damage_calibration": false
+}

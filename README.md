@@ -240,6 +240,35 @@ Model training code is maintained in the companion repository **[NathanWu7/Taber
 
 ---
 
+## 🎥 Offline Five-Panel Debug Video
+
+`debug_mode=6` policy captures can be exported as a single auditable video containing
+agentview, eye-in-hand, left/right GelSight marker views, plus synchronized squeeze-force and
+gripper-joint-position curves:
+
+```bash
+python scripts/tools/export_mode6_five_panel_video.py \
+  --capture-exp-dir /path/to/capture_mode6/.../exp_000 \
+  --output /path/to/combined_5view_force_gripper_curve.mp4
+```
+
+The exporter defaults to 1920×1080, 20 FPS, H.264/YUV420P and writes a JSON manifest next
+to the video. It strictly requires the four PNG streams and `forces.jsonl` to have identical,
+contiguous frame indices; it never fabricates a missing terminal frame. Scalar schema v3
+separately records and plots the blue raw model target, red controller-effective target after
+feed-forward/override, and orange unfiltered measured squeeze. The orange samples become the
+reward metric only after the grasp/contact gate is applied. Schema-v2 captures remain readable
+when a matching evaluator step trace is available: the exporter auto-discovers that trace and
+uses it to add the controller-effective target and unfiltered measured squeeze. If the trace is
+stored outside the run directory, pass it explicitly with `--step-trace`.
+See the [Tools Guide](docs/TOOLS.md) for details. The gripper panel plots the raw model
+`d_pred` in cyan, the controller-corrected and clamped `d_cmd` in green, and
+`d_actual=mean(q_left,q_right)` in magenta. It never averages the signed policy observation
+`[q_left,-q_right]`. Captures made before scalar schema v2 are rejected because their gripper
+scalar cannot be interpreted as joint travel.
+
+---
+
 ## 📚 Documentation
 
 Detailed workflow documentation is organized under [`docs/`](docs/):

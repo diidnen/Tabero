@@ -1,0 +1,379 @@
+{
+  "task_suite_name": "libero_object",
+  "total_tasks": 1,
+  "tasks": [
+    {
+      "task_id": 0,
+      "task_name": "pick_up_the_alphabet_soup_and_place_it_in_the_basket",
+      "language_instruction": "pick up the alphabet soup and place it in the basket",
+      "problem_name": "libero_floor_manipulation",
+      "bddl_file": "/data/Projects/Robotics/Others/LIBERO/libero/libero/./bddl_files/libero_object/pick_up_the_alphabet_soup_and_place_it_in_the_basket.bddl",
+      "obj_of_interest": [
+        "alphabet_soup_1"
+      ],
+      "targets": [
+        "basket_1"
+      ],
+      "goals": [
+        {
+          "relationship": "in",
+          "ref_obj": "alphabet_soup_1",
+          "target": "basket_1",
+          "xy_threshold": 0.2,
+          "height_threshold": 0.2,
+          "height_diff": 0,
+          "enable_force_threshold": "True",
+          "force_threshold": 0.05
+        }
+      ],
+      "fixtures": {
+        "floor": {
+          "type": "floor",
+          "xml_path": "/data/Projects/Robotics/Others/LIBERO/libero/libero/./assets/scenes/floor.xml",
+          "scale": [
+            1,
+            1,
+            1
+          ],
+          "initial_pose": [
+            0,
+            0,
+            -0.025
+          ]
+        }
+      },
+      "objects": {
+        "alphabet_soup_1": {
+          "type": "alphabet_soup",
+          "xml_path": "/data/Projects/Robotics/Others/LIBERO/libero/libero/./assets/stable_hope_objects/alphabet_soup/alphabet_soup.xml",
+          "scale": [
+            0.01,
+            0.01,
+            0.01
+          ],
+          "initial_region": "floor_target_object_region"
+        },
+        "basket_1": {
+          "type": "basket",
+          "xml_path": "/data/Projects/Robotics/Others/LIBERO/libero/libero/./assets/stable_scanned_objects/basket/basket.xml",
+          "scale": [
+            1,
+            1,
+            1
+          ],
+          "initial_region": "floor_bin_region"
+        },
+        "salad_dressing_1": {
+          "type": "salad_dressing",
+          "xml_path": "/data/Projects/Robotics/Others/LIBERO/libero/libero/./assets/stable_hope_objects/salad_dressing/salad_dressing.xml",
+          "scale": [
+            0.01,
+            0.01,
+            0.01
+          ],
+          "initial_region": "floor_other_object_region_0"
+        },
+        "cream_cheese_1": {
+          "type": "cream_cheese",
+          "xml_path": "/data/Projects/Robotics/Others/LIBERO/libero/libero/./assets/stable_hope_objects/cream_cheese/cream_cheese.xml",
+          "scale": [
+            0.008,
+            0.008,
+            0.008
+          ],
+          "initial_region": "floor_other_object_region_1"
+        },
+        "milk_1": {
+          "type": "milk",
+          "xml_path": "/data/Projects/Robotics/Others/LIBERO/libero/libero/./assets/stable_hope_objects/milk/milk.xml",
+          "scale": [
+            0.0075,
+            0.0075,
+            0.0075
+          ],
+          "initial_region": "floor_other_object_region_2"
+        },
+        "tomato_sauce_1": {
+          "type": "tomato_sauce",
+          "xml_path": "/data/Projects/Robotics/Others/LIBERO/libero/libero/./assets/stable_hope_objects/tomato_sauce/tomato_sauce.xml",
+          "scale": [
+            0.01,
+            0.01,
+            0.01
+          ],
+          "initial_region": "floor_other_object_region_3"
+        },
+        "butter_1": {
+          "type": "butter",
+          "xml_path": "/data/Projects/Robotics/Others/LIBERO/libero/libero/./assets/stable_hope_objects/butter/butter.xml",
+          "scale": [
+            0.0075,
+            0.0075,
+            0.0075
+          ],
+          "initial_region": "floor_other_object_region_4"
+        }
+      },
+      "regions": {
+        "floor_bin_region": {
+          "pose_range": {
+            "x": [
+              -0.019561630981042983,
+              0.019711980717256664
+            ],
+            "y": [
+              0.241084066927433,
+              0.27936796635389327
+            ],
+            "z": [
+              -0.00458262674510479,
+              -0.00458262674510479
+            ],
+            "roll": [
+              -1.7602198676414105e-7,
+              -1.7602198676414105e-7
+            ],
+            "pitch": [
+              0.004790741183683611,
+              0.004790741183683611
+            ],
+            "yaw": [
+              1.570796267189566,
+              1.570796267189566
+            ]
+          },
+          "target": "floor"
+        },
+        "floor_target_object_region": {
+          "pose_range": {
+            "x": [
+              -0.12434114992618561,
+              -0.1143411499261856
+            ],
+            "y": [
+              -0.2448446798324585,
+              -0.2348446798324585
+            ],
+            "z": [
+              0.03837934508919716,
+              0.03837934508919716
+            ],
+            "roll": [
+              1.5724719678548222,
+              1.5724719678548222
+            ],
+            "pitch": [
+              -0.006414350335183006,
+              -0.006414350335183006
+            ],
+            "yaw": [
+              3.1415657913644566,
+              3.1415657913644566
+            ]
+          },
+          "target": "floor"
+        },
+        "floor_other_object_region_0": {
+          "pose_range": {
+            "x": [
+              0.04498673498630524,
+              0.05498825870454311
+            ],
+            "y": [
+              -0.10498102076351642,
+              -0.0949779999256134
+            ],
+            "z": [
+              0.09144217520952225,
+              0.09147152863442898
+            ],
+            "roll": [
+              1.5706533948406598,
+              1.5706676212822304
+            ],
+            "pitch": [
+              0.0002882504504260197,
+              0.00031700730854744563
+            ],
+            "yaw": [
+              1.5707973364976135,
+              1.5707975188878631
+            ]
+          },
+          "target": "floor"
+        },
+        "floor_other_object_region_1": {
+          "pose_range": {
+            "x": [
+              -0.15985857501626016,
+              -0.14109930351376532
+            ],
+            "y": [
+              0.05018561437726021,
+              0.06980377078056337
+            ],
+            "z": [
+              0.00892147608101368,
+              0.00892147608101368
+            ],
+            "roll": [
+              -0.000002139557182090357,
+              -0.000002139557182090357
+            ],
+            "pitch": [
+              6.326018819891033e-7,
+              6.326018819891033e-7
+            ],
+            "yaw": [
+              3.141592653268294,
+              3.141592653268294
+            ]
+          },
+          "target": "floor"
+        },
+        "floor_other_object_region_2": {
+          "pose_range": {
+            "x": [
+              0.09041412018239497,
+              0.10977720692753792
+            ],
+            "y": [
+              -0.20989850342273714,
+              -0.19019912227988242
+            ],
+            "z": [
+              0.06699836999177933,
+              0.06699836999177933
+            ],
+            "roll": [
+              1.570818618932039,
+              1.570818618932039
+            ],
+            "pitch": [
+              -0.0000879764558021634,
+              -0.0000879764558021634
+            ],
+            "yaw": [
+              1.570796207585607,
+              1.570796207585607
+            ]
+          },
+          "target": "floor"
+        },
+        "floor_other_object_region_3": {
+          "pose_range": {
+            "x": [
+              0.14524226143956184,
+              0.15524228394031525
+            ],
+            "y": [
+              0.02505554899573326,
+              0.03505557609722018
+            ],
+            "z": [
+              0.038399867713451385,
+              0.038399867713451385
+            ],
+            "roll": [
+              1.5722774146770915,
+              1.5722774146770915
+            ],
+            "pitch": [
+              -0.006480314955855437,
+              -0.00648031449018438
+            ],
+            "yaw": [
+              3.1415873847539855,
+              3.141587486512437
+            ]
+          },
+          "target": "floor"
+        },
+        "floor_other_object_region_4": {
+          "pose_range": {
+            "x": [
+              -0.20931259721517564,
+              -0.19035554841160773
+            ],
+            "y": [
+              -0.08955301135778428,
+              -0.07008680492639541
+            ],
+            "z": [
+              0.008695431053638458,
+              0.008695431053638458
+            ],
+            "roll": [
+              -0.000004843239821639145,
+              -0.000004843239821639145
+            ],
+            "pitch": [
+              8.34584568565333e-7,
+              8.34584568565333e-7
+            ],
+            "yaw": [
+              3.141592651812781,
+              3.141592651812781
+            ]
+          },
+          "target": "floor"
+        }
+      },
+      "workspace_name": "floor",
+      "workspace_full_size": [
+        0,
+        0,
+        0
+      ],
+      "workspace_offset": [
+        0,
+        0,
+        -0.035
+      ],
+      "robot_base_pos": [
+        -0.6,
+        0,
+        0
+      ],
+      "robot_base_ori": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "tactile_targets": [
+        "alphabet_soup_1"
+      ],
+      "physics": {
+        "objects": {
+          "alphabet_soup_1": {
+            "damage": {
+              "max_squeeze_force": 1000000,
+              "consecutive_frames": 4
+            },
+            "friction": {
+              "static": 0.6,
+              "dynamic": 0.45
+            },
+            "mass_kg": 1.05
+          }
+        },
+        "gripper": {
+          "friction": {
+            "static": 0.5,
+            "dynamic": 0.5
+          }
+        }
+      },
+      "control_overrides": {
+        "target_contact_squeeze": {
+          "enabled": true,
+          "target_object": "alphabet_soup_1",
+          "single_finger_normal_force_n": 13,
+          "contact_threshold_n": 0.1,
+          "activation": "first_contact_latched"
+        }
+      }
+    }
+  ]
+}

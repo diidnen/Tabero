@@ -50,3 +50,5 @@ benchmarks/datasets/tabero/replayed_demos
 benchmarks/datasets/tabero/gentle_force/
 benchmarks/datasets/tabero/firm_force/
 results/
+
+*.sha256

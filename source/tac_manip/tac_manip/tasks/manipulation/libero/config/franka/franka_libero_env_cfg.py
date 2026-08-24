@@ -9,16 +9,20 @@ import os
 from dataclasses import MISSING
 
 import isaaclab.sim as sim_utils
-from isaaclab.devices.device_base import DevicesCfg
-from isaaclab.devices.keyboard import Se3KeyboardCfg
-from isaaclab.devices.openxr import OpenXRDevice, OpenXRDeviceCfg
-from isaaclab.devices.openxr.retargeters import GripperRetargeterCfg, Se3RelRetargeterCfg
-from isaaclab.devices.spacemouse import Se3SpaceMouseCfg
 from isaaclab.actuators.actuator_cfg import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
 from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
 from isaaclab.controllers.operational_space_cfg import OperationalSpaceControllerCfg
+from isaaclab.devices.device_base import DevicesCfg
+from isaaclab.devices.keyboard import Se3KeyboardCfg
+from isaaclab.devices.openxr import OpenXRDevice, OpenXRDeviceCfg
+from isaaclab.devices.openxr.retargeters import (
+    GripperRetargeterCfg,
+    Se3RelRetargeterCfg,
+)
+from isaaclab.devices.spacemouse import Se3SpaceMouseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
+from isaaclab.envs import mdp as isaaclab_mdp
 from isaaclab.envs.mdp.actions.actions_cfg import (
     DifferentialInverseKinematicsActionCfg,
     OperationalSpaceControllerActionCfg,
@@ -38,7 +42,21 @@ from isaaclab.utils.assets import NVIDIA_NUCLEUS_DIR
 from isaaclab_tasks.manager_based.manipulation.stack.mdp import franka_stack_events
 
 from tac_manip.tasks.manipulation.libero import mdp
-from tac_manip.core.sensors import GripperContactSensorCfg
+from tac_manip.tasks.manipulation.libero.control_config import (
+    parse_target_contact_squeeze_override,
+)
+from tac_manip.tasks.manipulation.libero.physics_config import (
+    FixedDamageThresholdConfig,
+    FixedFrictionConfig,
+    FixedMassConfig,
+    MassFrictionDamageThresholdConfig,
+    UniformFrictionConfig,
+    UniformMassConfig,
+    parse_gripper_friction_config,
+    parse_object_damage_configs,
+    parse_object_friction_configs,
+    parse_object_mass_configs,
+)
 
 ##
 # Pre-defined configs
@@ -81,6 +99,13 @@ class LiberoTaskConfig:
             self.goals = self.task_info["goals"]  # goals: trajectory success conditions.
             self.robot_base_pos = self.task_info["robot_base_pos"]  # robot base position: [x, y, z]
             self.robot_base_ori = self.task_info["robot_base_ori"]  # robot base orientation: [w, x, y, z]
+            self.object_mass_configs = parse_object_mass_configs(self.task_info)
+            self.gripper_friction_config = parse_gripper_friction_config(self.task_info)
+            self.object_friction_configs = parse_object_friction_configs(self.task_info)
+            self.object_damage_configs = parse_object_damage_configs(self.task_info)
+            self.target_contact_squeeze_override = (
+                parse_target_contact_squeeze_override(self.task_info)
+            )
 
             # add targets for tactile sensor
             self.tactile_targets = self.task_info.get("tactile_targets", self.obj_of_interest)
@@ -89,6 +114,24 @@ class LiberoTaskConfig:
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
     value = os.getenv(name, "1" if default else "0").strip().lower()
     return value in ("1", "true", "t", "yes", "y", "on")
+
+
+def _friction_event_spec(
+    config: FixedFrictionConfig | UniformFrictionConfig,
+) -> tuple[str, tuple[float, float], tuple[float, float], int]:
+    if isinstance(config, FixedFrictionConfig):
+        return (
+            "startup",
+            (config.static_friction, config.static_friction),
+            (config.dynamic_friction, config.dynamic_friction),
+            1,
+        )
+    return (
+        config.apply_on,
+        (config.minimum_static_friction, config.maximum_static_friction),
+        (config.minimum_dynamic_friction, config.maximum_dynamic_friction),
+        config.num_buckets,
+    )
 
 
 def _libero_domelight_textures() -> list[str]:
@@ -375,6 +418,39 @@ class TerminationsCfg:
                 ),
             )
 
+        for object_name, damage_cfg in libero_config.object_damage_configs.items():
+            threshold_cfg = damage_cfg.threshold
+            if isinstance(threshold_cfg, FixedDamageThresholdConfig):
+                threshold_params = {
+                    "threshold_mode": "fixed",
+                    "max_squeeze_force": threshold_cfg.max_squeeze_force,
+                    "tolerance_factor": 1.1,
+                }
+            elif isinstance(threshold_cfg, MassFrictionDamageThresholdConfig):
+                threshold_params = {
+                    "threshold_mode": "mass_friction",
+                    "max_squeeze_force": None,
+                    "tolerance_factor": threshold_cfg.tolerance_factor,
+                }
+            else:
+                raise TypeError(
+                    f"Unsupported damage threshold config for {object_name!r}: "
+                    f"{type(threshold_cfg)!r}."
+                )
+            setattr(
+                self,
+                f"object_damage_{object_name}",
+                DoneTerm(
+                    func=mdp.object_damage_from_squeeze,
+                    params={
+                        "object_name": object_name,
+                        "contact_sensor_name": f"contact_grasp_{object_name}",
+                        "consecutive_frames": damage_cfg.consecutive_frames,
+                        **threshold_params,
+                    },
+                ),
+            )
+
         self.success = DoneTerm(
             func=mdp.libero_goals_reached,
             params={
@@ -476,11 +552,24 @@ class JointPositionLiberoEnvCfg(LiberoEnvCfg):
             max_depenetration_velocity=5.0,
             disable_gravity=False,
         )
+        squeeze_override = self.libero_config.target_contact_squeeze_override
 
         # add all objects
         for obj in self.libero_config.objects.items():
             obj_name = obj[0]
             obj_type = obj[1]["type"]
+            object_mass_cfg = self.libero_config.object_mass_configs.get(obj_name)
+            object_friction_cfg = self.libero_config.object_friction_configs.get(obj_name)
+            if (object_mass_cfg is not None or object_friction_cfg is not None) and obj_type in {
+                "flat_stove",
+                "microwave",
+                "white_cabinet",
+                "wooden_cabinet",
+            }:
+                raise ValueError(
+                    "LIBERO task mass/friction configuration currently supports only "
+                    f"RigidObjectCfg assets; {obj_name!r} is an articulated {obj_type!r} asset."
+                )
             if obj_type == "flat_stove":  # add flat_stove as an articulation
                 self.scene.flat_stove_1 = ArticulationCfg(
                     prim_path="{ENV_REGEX_NS}/flat_stove_1",
@@ -621,6 +710,11 @@ class JointPositionLiberoEnvCfg(LiberoEnvCfg):
                     },
                 )
             else:
+                fixed_mass_props = (
+                    sim_utils.MassPropertiesCfg(mass=object_mass_cfg.mass_kg)
+                    if isinstance(object_mass_cfg, FixedMassConfig)
+                    else None
+                )
                 setattr(
                     self.scene,
                     obj_name,
@@ -631,12 +725,77 @@ class JointPositionLiberoEnvCfg(LiberoEnvCfg):
                             usd_path=f"{self.libero_config.assets_dir}/{obj_type}/{obj_type}.usd",
                             activate_contact_sensors=(
                                 obj_name in self.libero_config.targets
+                                or (
+                                    squeeze_override is not None
+                                    and obj_name
+                                    == squeeze_override.target_object
+                                )
                             ),  # need to activate contact sensor for target object
                             scale=obj[1]["scale"],
+                            mass_props=fixed_mass_props,
                             rigid_props=object_properties,
                         ),
                     ),
                 )
+                if isinstance(object_mass_cfg, UniformMassConfig):
+                    setattr(
+                        self.events,
+                        f"randomize_mass_{obj_name}",
+                        EventTerm(
+                            func=isaaclab_mdp.randomize_rigid_body_mass,
+                            mode=object_mass_cfg.apply_on,
+                            params={
+                                "asset_cfg": SceneEntityCfg(obj_name),
+                                "mass_distribution_params": (
+                                    object_mass_cfg.minimum_kg,
+                                    object_mass_cfg.maximum_kg,
+                                ),
+                                "operation": "abs",
+                                "distribution": "uniform",
+                                "recompute_inertia": True,
+                            },
+                        ),
+                    )
+
+                if object_friction_cfg is not None:
+                    mode, static_range, dynamic_range, num_buckets = _friction_event_spec(
+                        object_friction_cfg
+                    )
+                    setattr(
+                        self.events,
+                        f"friction_{obj_name}",
+                        EventTerm(
+                            func=mdp.set_or_randomize_rigid_body_friction,
+                            mode=mode,
+                            params={
+                                "asset_cfg": SceneEntityCfg(obj_name),
+                                "static_friction_range": static_range,
+                                "dynamic_friction_range": dynamic_range,
+                                "num_buckets": num_buckets,
+                                "snapshot_key": obj_name,
+                            },
+                        ),
+                    )
+
+        gripper_friction_cfg = self.libero_config.gripper_friction_config
+        if gripper_friction_cfg is not None:
+            mode, static_range, dynamic_range, num_buckets = _friction_event_spec(
+                gripper_friction_cfg
+            )
+            self.events.friction_gripper = EventTerm(
+                func=mdp.set_or_randomize_rigid_body_friction,
+                mode=mode,
+                params={
+                    "asset_cfg": SceneEntityCfg(
+                        "robot",
+                        body_names=["panda_leftfinger", "panda_rightfinger"],
+                    ),
+                    "static_friction_range": static_range,
+                    "dynamic_friction_range": dynamic_range,
+                    "num_buckets": num_buckets,
+                    "snapshot_key": "gripper",
+                },
+            )
 
         # add contact force sensor for grasped checking
         for obj in self.libero_config.obj_of_interest:
@@ -649,6 +808,30 @@ class JointPositionLiberoEnvCfg(LiberoEnvCfg):
                     history_length=6,
                     debug_vis=False,
                     filter_prim_paths_expr=["{ENV_REGEX_NS}/" + f"{obj}"],
+                ),
+            )
+
+        # Optional target-centric sensor used only to gate the fixed-squeeze
+        # control override.  Keeping the target object as the single sensor
+        # body and the two actual GelSight contact bodies as filters avoids
+        # ContactSensor's unsupported many-sensor-bodies-to-one-filter
+        # topology.  The rigid gelpads attribute contact to their parent
+        # ``gelsight_mini_case_*`` bodies, not the Panda finger links.
+        if squeeze_override is not None:
+            setattr(
+                self.scene,
+                f"contact_target_squeeze_{squeeze_override.target_object}",
+                ContactSensorCfg(
+                    prim_path=(
+                        "{ENV_REGEX_NS}/" + squeeze_override.target_object
+                    ),
+                    update_period=0.0,
+                    history_length=1,
+                    debug_vis=False,
+                    filter_prim_paths_expr=[
+                        "{ENV_REGEX_NS}/Robot/gelsight_mini_case_left",
+                        "{ENV_REGEX_NS}/Robot/gelsight_mini_case_right",
+                    ],
                 ),
             )
 
@@ -912,8 +1095,8 @@ class IKLiberoCameraEnvCfg(JointPositionLiberoCameraEnvCfg):
             joint_names=["panda_joint.*"],
             body_name="panda_hand",
             controller=DifferentialIKControllerCfg(
-                command_type="pose", 
-                use_relative_mode=self.use_relative_mode, 
+                command_type="pose",
+                use_relative_mode=self.use_relative_mode,
                 ik_method="dls",
             ),
             scale=1.0,

@@ -1,0 +1,31 @@
+{
+  "schema_version": 2,
+  "profile": "alltask_fixed_damage_1000000_uniform_mass_05_16_friction_04_08_from_rlinf_sft_20k",
+  "source_profile": "alltask_damage_uniform_mass_05_16_friction_04_08_from_rlinf_sft_20k",
+  "active_derivation": {
+    "mode": "fixed",
+    "max_squeeze_force": 1000000.0,
+    "consecutive_frames": 4,
+    "purpose": "Keep the damage terminal installed while making its limit inactive over the benchmark's observed force range",
+    "validity_rule": "Any object-damage trigger invalidates the no-damage-limit baseline interpretation"
+  },
+  "tasks": {
+    "0": {"object": "alphabet_soup_1", "mass_source": "uniform [0.5, 1.6] kg on reset"},
+    "1": {"object": "cream_cheese_1", "mass_source": "uniform [0.5, 1.6] kg on reset"},
+    "2": {"object": "salad_dressing_1", "mass_source": "uniform [0.5, 1.6] kg on reset"},
+    "3": {"object": "bbq_sauce_1", "mass_source": "uniform [0.5, 1.6] kg on reset"},
+    "4": {"object": "ketchup_1", "mass_source": "uniform [0.5, 1.6] kg on reset"},
+    "5": {"object": "tomato_sauce_1", "mass_source": "uniform [0.5, 1.6] kg on reset"},
+    "6": {"object": "butter_1", "mass_source": "uniform [0.5, 1.6] kg on reset"},
+    "7": {"object": "milk_1", "mass_source": "uniform [0.5, 1.6] kg on reset"},
+    "8": {"object": "chocolate_pudding_1", "mass_source": "uniform [0.5, 1.6] kg on reset"},
+    "9": {"object": "orange_juice_1", "mass_source": "uniform [0.5, 1.6] kg on reset"}
+  },
+  "superseded_dynamic_threshold": {
+    "source": "alltask_damage_uniform_mass_05_16_friction_04_08_from_rlinf_sft_20k/threshold_provenance.json",
+    "mode": "mass_friction",
+    "tolerance_factor": 1.1,
+    "status": "not used by this profile"
+  },
+  "formal_physical_damage_calibration": false
+}

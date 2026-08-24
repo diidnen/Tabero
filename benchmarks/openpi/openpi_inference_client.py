@@ -7,12 +7,12 @@ import contextlib
 import hashlib
 import json
 import os
-import sys
 import re
-from datetime import datetime
+import sys
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -35,13 +35,24 @@ from benchmarks.common.closedloop_policy_inference import (
     ClosedLoopArguments,
     ClosedLoopPolicyInference,
 )
+from benchmarks.common.episode_metrics import (
+    TrajectoryForceTracker,
+    aggregate_success_force_metrics,
+    extract_damage_threshold_snapshot,
+    extract_friction_snapshot,
+    extract_object_damage_details,
+    resolve_episode_termination,
+    summarize_episode_force_metrics,
+    summarize_force_tracking_metrics,
+    summarize_trajectory_force_metrics,
+)
+from benchmarks.common.episode_lift import EpisodeLiftTracker
+from benchmarks.common.episode_video import EpisodeVideoWriter
 from benchmarks.common.metrics import (
-    compute_contact_force_metrics_from_13d,
-    compute_contact_force_metrics_from_lr_forces,
     compute_contact_force_series_from_lr_forces,
     compute_topk_mean,
 )
-
+from benchmarks.openpi.openpi_payload import infer_openpi_step
 
 TARGET_IMAGE_HW = (224, 224)
 
@@ -69,6 +80,67 @@ def _to_uint8_rgb(img) -> np.ndarray:
     elif img.dtype != np.uint8:
         img = img.astype(np.uint8)
     return img
+
+
+def _vector3_or_none(value) -> list[float] | None:
+    """Return one JSON-safe 3D vector, or None when unavailable."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        vector = np.asarray(value, dtype=np.float32).reshape(3)
+    except (TypeError, ValueError):
+        return None
+    if not np.all(np.isfinite(vector)):
+        return None
+    return [float(component) for component in vector]
+
+
+def _finite_float_or_none(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if np.isfinite(result) else None
+
+
+def _bool_or_none(value) -> bool | None:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        scalar = np.asarray(value).reshape(()).item()
+    except (TypeError, ValueError):
+        return None
+    if isinstance(scalar, (bool, np.bool_)):
+        return bool(scalar)
+    return None
+
+
+def _integer_or_none(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        scalar = np.asarray(value).reshape(()).item()
+    except (TypeError, ValueError):
+        return None
+    if isinstance(scalar, (int, np.integer)) and not isinstance(
+        scalar, (bool, np.bool_)
+    ):
+        return int(scalar)
+    return None
+
+
+def _contact_or_none(left: list[float] | None, right: list[float] | None) -> bool | None:
+    if left is None or right is None:
+        return None
+    return bool(np.linalg.norm(left) + np.linalg.norm(right) > 1e-6)
 
 
 def _pad_history_front(items: list[np.ndarray], target_len: int) -> list[np.ndarray]:
@@ -182,6 +254,27 @@ class _OnlineTactileBuffer:
             self._marker_init = init_pos
         self._marker_hist.append(curr_pos)
 
+    def append_control_sample(
+        self,
+        obs: dict,
+        *,
+        env=None,
+        include_tactile: bool = False,
+        env_id: int = 0,
+    ) -> None:
+        """Append one synchronized sample from an observation-producing control step."""
+        self.update_force(obs)
+        if not include_tactile:
+            return
+        if env is None:
+            raise ValueError("env is required when include_tactile=True")
+        try:
+            self.update_tactile_frames(env, env_id=env_id)
+        except Exception:
+            # Preserve the existing behavior: unavailable tactile RGB must not stop evaluation.
+            pass
+        self.update_marker_motion(obs)
+
     def get_tactile_image(self) -> np.ndarray | None:
         if len(self._left_frames) == 0 or len(self._right_frames) == 0:
             return None
@@ -218,11 +311,20 @@ class OpenpiClientArguments(ClosedLoopArguments):
     server_host: str = "127.0.1.1"
     server_port: int = 8000
     target_image_size: tuple[int, int, int] = (224, 224, 3)
+    # Send both 256x256 DSRL raw views (agentview and eye-in-hand).
+    send_dsrl_raw_image: bool = False
 
     # Simulator specific parameters
     # Default to headless to avoid X11/GLX BadMatch crashes on servers or misconfigured displays.
     # If you want a GUI window, pass: --no-headless
     headless: bool = True
+    # IsaacLab/Kit device. Unlike CUDA_VISIBLE_DEVICES, AppLauncher's active_gpu/physics_gpu
+    # can be interpreted as a physical GPU id by the renderer, so keep this explicit.
+    sim_device: str = os.environ.get("ISAACLAB_DEVICE", "cuda:0")
+    # Keep single-GPU app launch by default. Multi-GPU mode can probe or initialize extra GPUs.
+    sim_multi_gpu: bool = False
+    # Extra Kit args, for example: --/renderer/activeGpu=8
+    sim_kit_args: str = os.environ.get("ISAACLAB_KIT_ARGS", "")
     seed: int = 11
     randomize_light: bool = False
     # debug_mode:
@@ -241,6 +343,8 @@ class OpenpiClientArguments(ClosedLoopArguments):
     # Default to a repo-local folder for full debug records (images + tactile + forces).
     # You can override via CLI: --debug_path /abs/path/to/dir
     debug_path: str = str(project_root / "full_records")
+    # Optional force-only JSONL. This is independent from debug_mode=6 image capture.
+    step_trace_path: Optional[Path] = None
 
     camera_names: tuple[str, ...] = ("agentview_cam", "eye_in_hand_cam")
     tactile_sensor_names: tuple[str, str] = ("gsmini_left", "gsmini_right")
@@ -253,6 +357,12 @@ class OpenpiClientArguments(ClosedLoopArguments):
     max_inference_steps: int = 30  # max number of inference steps to run
     num_success_steps: int = 8  # continuous success steps to consider the policy as successful
     num_total_experiments: int = 50  # total number of experiments to do policy evaluation
+    # A lift is a post-contact height increase held for consecutive env steps.
+    lift_height_threshold_m: float = 0.03
+    lift_hold_steps: int = 5
+    # Match RLinf success.force_bonus trajectory-force eligibility.
+    reward_force_contact_epsilon_n: float = 1.0
+    reward_force_min_valid_samples: int = 4
 
     # Control mode parameters
     # Supported modes:
@@ -299,6 +409,10 @@ class OpenpiClientArguments(ClosedLoopArguments):
 
 # Parse arguments first to get task_suite and task_id
 args = tyro.cli(OpenpiClientArguments)
+if not np.isfinite(args.lift_height_threshold_m) or args.lift_height_threshold_m <= 0.0:
+    raise ValueError("lift_height_threshold_m must be finite and positive")
+if isinstance(args.lift_hold_steps, bool) or args.lift_hold_steps <= 0:
+    raise ValueError("lift_hold_steps must be a positive integer")
 os.environ["LIBERO_RANDOMIZE_LIGHT"] = "1" if args.randomize_light else "0"
 
 
@@ -336,13 +450,6 @@ def _rewrite_instruction(instruction: str, adverb: str, seed: int, key: str) -> 
     if style == "suffix":
         return f"{instruction} {adverb}"
     return f"{adverb} {instruction}"
-
-
-def _add_bytes_key_aliases(d: dict, keys: tuple[str, ...]) -> None:
-    """Add bytes-key aliases for servers that decode msgpack map keys as bytes."""
-    for k in keys:
-        if k in d and isinstance(k, str):
-            d[k.encode("utf-8")] = d[k]
 
 
 # Set USE_RELATIVE_MODE environment variable for DiffIK controller
@@ -388,7 +495,15 @@ else:
     print(f"Using HDF5 folder from command line (--hdf5.folder): {args.hdf5_folder}")
 
 # Launch the simulator FIRST before importing tac_manip modules
-app_launcher = AppLauncher(headless=args.headless, enable_cameras=True, num_envs=1)
+print(f"Using IsaacLab simulation device: {args.sim_device}")
+app_launcher = AppLauncher(
+    headless=args.headless,
+    enable_cameras=True,
+    num_envs=1,
+    device=args.sim_device,
+    multi_gpu=args.sim_multi_gpu,
+    kit_args=args.sim_kit_args,
+)
 simulation_app = app_launcher.app
 
 # add configs for dataset generation for various task_suite and task_id,
@@ -406,7 +521,6 @@ from isaaclab_tasks.utils import import_packages
 from benchmarks.openpi.env import (
     axisangle2quat,
     quat2axisangle,
-    resize_frames_with_padding,
 )
 
 # The blacklist is used to prevent importing configs from sub-packages
@@ -487,6 +601,20 @@ def run_closed_loop_policy(  # noqa: C901
     success_term: Callable[[gym.Env], bool] | None,
 ):
     """Run the closed loop policy evaluation."""
+    if (
+        not np.isfinite(args.reward_force_contact_epsilon_n)
+        or args.reward_force_contact_epsilon_n < 0.0
+    ):
+        raise ValueError(
+            "--reward-force-contact-epsilon-n must be finite and non-negative"
+        )
+    if (
+        isinstance(args.reward_force_min_valid_samples, bool)
+        or args.reward_force_min_valid_samples < 1
+    ):
+        raise ValueError(
+            "--reward-force-min-valid-samples must be a positive integer"
+        )
     tactile_buf = _OnlineTactileBuffer(
         tactile_sensors=args.tactile_sensor_names,
         tactile_output_type=args.tactile_output_type,
@@ -545,6 +673,15 @@ def run_closed_loop_policy(  # noqa: C901
                 "prompt_adverb": (args.prompt_adverb or "").strip(),
                 "prompt_adverbs": list(args.prompt_adverbs) if args.prompt_adverbs else [],
                 "prompt_seed": int(args.prompt_seed),
+                "mode6_scalar_schema_version": 3,
+                "force_target_semantics": {
+                    "predicted": "raw_model_squeeze_target",
+                    "effective": "controller_target_after_feed_forward_or_override",
+                    "measured_ema": "controller_filtered_measured_squeeze",
+                    "measured_raw": "unfiltered_gripper_local_squeeze",
+                },
+                "gripper_command_semantics": "controller_d_cmd",
+                "gripper_measured_semantics": "mean_raw_finger_joint_position",
                 "timestamp": ts,
             }
             with open(capture_mode6_root / "run_meta.json", "w", encoding="utf-8") as f:
@@ -552,13 +689,34 @@ def run_closed_loop_policy(  # noqa: C901
         except Exception as e:
             print(f"[DebugMode 6] Failed to write run_meta.json: {e}")
 
+    video_output_dir: Path | None = None
+    video_fps = 20.0
+    if args.record_videos:
+        video_output_dir = Path(
+            args.record_camera_output_path
+            or (project_root / "evaluation_results" / "episode_videos")
+        )
+        video_output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            step_dt = float(env.unwrapped.step_dt)
+            if np.isfinite(step_dt) and step_dt > 0.0:
+                video_fps = 1.0 / step_dt
+        except Exception:
+            pass
+        print(
+            f"[Video] Recording every env step to {video_output_dir} "
+            f"at {video_fps:.3f} FPS."
+        )
+
     # Hybrid 力–位混合在线可视化（仅在 debug_mode == 4 时启用）
     force_viz = None
     if args.debug_mode == 4 and "Isaac-Libero-Franka-Hybrid-" in args.task and args.num_envs == 1:
         try:
             # 复用 scripts/tools 中的调试可视化工具
             # 注意：此处从工程根目录下的 scripts.tools.common 导入，而不是相对路径的 common。
-            from scripts.tools.common.force_position_debug_viz import ForcePositionDebugVisualizer
+            from scripts.tools.common.force_position_debug_viz import (
+                ForcePositionDebugVisualizer,
+            )
 
             force_viz = ForcePositionDebugVisualizer()
             print("[DebugMode 4] Enabled Hybrid force-position debug visualizer.")
@@ -571,26 +729,19 @@ def run_closed_loop_policy(  # noqa: C901
             "with num_envs == 1. Skipping visualizer initialization."
         )
 
+    step_trace_fh = None
+    step_trace_open_error: str | None = None
+    if args.step_trace_path is not None:
+        try:
+            trace_path = Path(args.step_trace_path)
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            step_trace_fh = open(trace_path, "x", encoding="utf-8", buffering=1)
+        except Exception as exc:
+            step_trace_open_error = str(exc)
+            print(f"[Step-Trace] Failed to create {args.step_trace_path}: {exc}")
+
     successful_experiments = 0
-
-    # 统计：跨所有成功 experiment 的夹爪挤压力均值（仅在 Hybrid 环境中有效）
-    succ_squeeze_pred_sum = 0.0
-    succ_squeeze_meas_sum = 0.0
-    succ_squeeze_count = 0
-
-    # 统计：跨所有成功 experiment 的挤压力 / 加持力 metrics（仅在 Hybrid + 13D action 时有效）
-    succ_metrics_count = 0
-    succ_squeeze_max_sum = 0.0
-    succ_app_max_sum = 0.0
-    succ_app_mean_sum = 0.0
-
-    # 统计：跨所有成功 experiment 的「实测」Top5% 最大挤压力 / 加持力及平均加持力
-    succ_squeeze_max_meas_sum = 0.0
-    succ_squeeze_max_meas_count = 0
-    succ_ap_mean_meas_sum = 0.0
-    succ_ap_mean_meas_count = 0
-    succ_ap_max_meas_sum = 0.0
-    succ_ap_max_meas_count = 0
+    episode_metrics_records: list[dict] = []
 
     # Find HDF5 file based on task_suite and task_id
     hdf5_file = find_hdf5_file(args.hdf5_folder, args.task_suite, args.task_id)
@@ -623,6 +774,7 @@ def run_closed_loop_policy(  # noqa: C901
     with open(task_config_path) as f:
         task_suite_config = json.load(f)
 
+    selected_task_config: dict | None = None
     cli_instruction = (args.language_instruction or "").strip()
     if cli_instruction:
         print(f"\nUsing language instruction (from CLI): {cli_instruction}")
@@ -631,9 +783,34 @@ def run_closed_loop_policy(  # noqa: C901
         for task in task_suite_config["tasks"]:
             task_id = task["task_id"]
             if task_id == args.task_id:
+                selected_task_config = task
                 args.language_instruction = task["language_instruction"]
                 print(f"\nUsing language instruction (from task config): {args.language_instruction}")
                 break
+
+    if selected_task_config is None:
+        selected_task_config = next(
+            (
+                task
+                for task in task_suite_config["tasks"]
+                if task["task_id"] == args.task_id
+            ),
+            None,
+        )
+    lift_target_object: str | None = None
+    if selected_task_config is not None:
+        target_override = (
+            selected_task_config.get("control_overrides", {})
+            .get("target_contact_squeeze", {})
+        )
+        if target_override.get("enabled") is True:
+            target_object = target_override.get("target_object")
+            if not isinstance(target_object, str) or not target_object:
+                raise ValueError(
+                    "enabled target_contact_squeeze requires a non-empty "
+                    "target_object for lift tracking"
+                )
+            lift_target_object = target_object
 
     client = _websocket_client_policy.WebsocketClientPolicy(args.server_host, args.server_port)
     with contextlib.suppress(KeyboardInterrupt) and torch.inference_mode():
@@ -642,23 +819,55 @@ def run_closed_loop_policy(  # noqa: C901
             success_step_count = 0
             experiment_success = False
             total_steps_taken = 0
-
-            # 当前 experiment 的挤压力统计（均值）
-            exp_fsq_pred_sum = 0.0
-            exp_fsq_meas_sum = 0.0
-            exp_fsq_count = 0
+            inference_chunks_taken = 0
+            end_reason = "max_inference_steps"
+            terminal_term: str | None = None
+            damage_details: dict | None = None
+            damage_threshold_snapshot: dict | None = None
+            friction_snapshot: dict | None = None
+            dataset_episode_index: int | None = None
 
             # 当前 experiment 的逐帧挤压力 / 加持力记录（用于 Top5% 统计）
             exp_fsq_pred_values: list[float] = []
             exp_fsq_meas_values: list[float] = []
             exp_ap_pred_values: list[float] = []
             exp_ap_meas_values: list[float] = []
-            # binary 模式：额外缓存逐步左右指 3D 力序列（用于严格复用 metrics.py 的统计定义）
+            # 缓存逐步左右指实测 3D 力，用于接触步数与覆盖率统计。
             exp_fL_meas_values: list[np.ndarray] = []
             exp_fR_meas_values: list[np.ndarray] = []
+            exp_tracking_reward_valid: list[bool] = []
+            exp_tracking_squeeze_pred: list[float | None] = []
+            exp_tracking_squeeze_target_eff: list[float | None] = []
+            exp_tracking_squeeze_meas_raw: list[float | None] = []
+            exp_tracking_gripper_pred: list[float | None] = []
+            exp_tracking_gripper_cmd: list[float | None] = []
 
-            # 当前 experiment 的 Hybrid 13D 动作缓存（仅在 control_mode == "hybrid" 时使用）
+            # RLinf success.force_bonus-equivalent trajectory force tracking.
+            trajectory_force_tracker: TrajectoryForceTracker | None = None
+            trajectory_force_error: str | None = None
+
+            # JSON-configured target-contact squeeze override audit.
+            exp_override_configured = False
+            exp_override_activated = False
+            exp_override_activation_step: int | None = None
+            exp_override_active_steps = 0
+            exp_override_contact_steps = 0
+            exp_override_single_finger_target_n: float | None = None
+            exp_override_squeeze_target_n: float | None = None
+            exp_override_left_normal_abs: list[float] = []
+            exp_override_right_normal_abs: list[float] = []
+            lift_tracker: EpisodeLiftTracker | None = None
+            lift_object = None
+
+            # 当前 experiment 的 Hybrid 13D 动作缓存。
             exp_actions_13d: list[torch.Tensor] = []
+            exp_step_trace_rows: list[dict] = []
+
+            episode_video = (
+                EpisodeVideoWriter(video_output_dir, exp_idx, video_fps)
+                if video_output_dir is not None
+                else None
+            )
 
             # debug_mode=6: per-experiment capture directories + force log (JSONL)
             mode6_exp_dir: Path | None = None
@@ -689,6 +898,7 @@ def run_closed_loop_policy(  # noqa: C901
             if episode_indices_to_use:
                 # Use episode index from the list (cycling through all episodes)
                 episode_index = episode_indices_to_use[exp_idx % len(episode_indices_to_use)]
+                dataset_episode_index = int(episode_index)
                 episode_data = dataset_file_handler.load_episode(episode_map[episode_index], env.unwrapped.device)
 
                 if "initial_state" in episode_data.data:
@@ -708,8 +918,35 @@ def run_closed_loop_policy(  # noqa: C901
                 # Fallback to default reset if no dataset file specified or doesn't exist
                 obs, info = env.reset()
 
+            if lift_target_object is not None:
+                if lift_target_object not in env.unwrapped.scene.keys():
+                    raise RuntimeError(
+                        f"Lift target {lift_target_object!r} is missing from the scene"
+                    )
+                lift_object = env.unwrapped.scene[lift_target_object]
+                initial_height_m = float(
+                    lift_object.data.root_pos_w[0, 2].detach().cpu().item()
+                )
+                lift_tracker = EpisodeLiftTracker(
+                    target_object=lift_target_object,
+                    initial_height_m=initial_height_m,
+                    height_threshold_m=float(args.lift_height_threshold_m),
+                    hold_steps_required=int(args.lift_hold_steps),
+                )
+
+            friction_snapshot = extract_friction_snapshot(info=info, env_index=0)
+            damage_threshold_snapshot = extract_damage_threshold_snapshot(
+                info=info, env_index=0
+            )
+
             # Reset online histories per experiment to match dataset windowing.
             tactile_buf.reset()
+            tactile_buf.append_control_sample(
+                obs,
+                env=env,
+                include_tactile=args.control_mode in ("tactile", "binary"),
+                env_id=0,
+            )
 
             frame_count = 0
             terminated = torch.tensor([False])  # Initialize to handle case where inner loop doesn't execute
@@ -742,6 +979,15 @@ def run_closed_loop_policy(  # noqa: C901
                         "camera_names": list(args.camera_names),
                         "tactile_sensor_names": list(args.tactile_sensor_names),
                         "tactile_output_type_saved": "markers_rgb",
+                        "mode6_scalar_schema_version": 3,
+                        "force_target_semantics": {
+                            "predicted": "raw_model_squeeze_target",
+                            "effective": "controller_target_after_feed_forward_or_override",
+                            "measured_ema": "controller_filtered_measured_squeeze",
+                            "measured_raw": "unfiltered_gripper_local_squeeze",
+                        },
+                        "gripper_command_semantics": "controller_d_cmd",
+                        "gripper_measured_semantics": "mean_raw_finger_joint_position",
                     }
                     with open(mode6_exp_dir / "exp_meta.json", "w", encoding="utf-8") as f:
                         json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -750,21 +996,11 @@ def run_closed_loop_policy(  # noqa: C901
 
             for action_idx in range(args.max_inference_steps):
                 # Get camera images from live cameras
-                rgbs = []
-                for cam_name in list(args.camera_names):
-                    cam_id = cam_name.split("_")[0]
+                camera_frames = []
+                for cam_name in args.camera_names:
                     cam = env.unwrapped.scene[cam_name]
                     rgb = cam.data.output["rgb"]
-                    rgb = resize_frames_with_padding(rgb, args.target_image_size, bgr_conversion=False, pad_img=True)
-                    rgbs.append(rgb)
-
-                    # 仅在 debug_mode=2/3 时保存相机帧到本地
-                    if args.debug_mode in (2, 3):
-                        rgb_np = (rgb * 255).astype(np.uint8) if rgb.dtype == np.float32 else rgb.copy()
-                        cv2.imwrite(
-                            str(f"{args.debug_path}/frame_{frame_count:04d}_{cam_id}.png"),
-                            cv2.cvtColor(rgb_np[0], cv2.COLOR_RGB2BGR),
-                        )
+                    camera_frames.append((cam_name, rgb))
 
                 # Run model inference to get predicted actions (for comparison or execution)
                 inference_actions = None
@@ -793,21 +1029,8 @@ def run_closed_loop_policy(  # noqa: C901
                 # Base 7D state: [x, y, z, ax, ay, az, gripper_abs]
                 task_state_7 = np.concatenate((pos, axis_angle, gripper_scalar), axis=0).astype(np.float32)
 
-                # For Hybrid force–position control, compute finger force history (left/right, 3D each)
-                tactile_buf.update_force(obs)
-                if args.control_mode in ("tactile", "binary"):
-                    # Tactile modalities (Tabero-style): tactile_image + tactile_gripper_force + tactile_marker_motion
-                    try:
-                        tactile_buf.update_tactile_frames(env, env_id=0)
-                    except Exception:
-                        pass
-                    tactile_buf.update_marker_motion(obs)
-
                 # All modes: state is pure task-space 7D; forces are sent separately for hybrid
                 eef_pose_states = task_state_7
-
-                image = _to_uint8_rgb(np.squeeze(rgbs[0], axis=0))
-                wrist_image = _to_uint8_rgb(np.squeeze(rgbs[1], axis=0))
 
                 # Print modified instruction once so you can verify what is sent to the server.
                 if action_idx == 0 and (exp_idx == 0 or args.debug_mode > 0):
@@ -817,13 +1040,8 @@ def run_closed_loop_policy(  # noqa: C901
                         print(f"[Prompt] {exp_prompt}")
 
                 element = {
-                    # Top-level keys (image / state) for OpenPI transforms
-                    "image": image,
-                    "wrist_image": wrist_image,
+                    # Image keys are added by the CPU-testable production payload builder.
                     "state": eef_pose_states,
-                    # Nested "observation/*" keys to keep Tabero-style compatibility
-                    "observation/image": image,
-                    "observation/wrist_image": wrist_image,
                     "observation/state": eef_pose_states,
                     "prompt": exp_prompt,
                 }
@@ -848,33 +1066,33 @@ def run_closed_loop_policy(  # noqa: C901
                         element["tactile_marker_motion"] = tac_mm
                         element["observation/tactile_marker_motion"] = tac_mm
 
-                # Add bytes-key aliases for server-side msgpack decoders that return bytes keys.
-                _add_bytes_key_aliases(
-                    element,
-                    (
-                        "image",
-                        "wrist_image",
-                        "state",
-                        "prompt",
-                        "gripper_force",
-                        "tactile_image",
-                        "tactile_gripper_force",
-                        "tactile_marker_motion",
-                        "observation/image",
-                        "observation/wrist_image",
-                        "observation/state",
-                        "observation/gripper_force",
-                        "observation/tactile_image",
-                        "observation/tactile_gripper_force",
-                        "observation/tactile_marker_motion",
-                    ),
+                before_infer = None
+                if args.debug_mode in (2, 3):
+                    def _save_debug_frames(resized_frames):
+                        for (cam_name, _), rgb in zip(camera_frames, resized_frames):
+                            cam_id = cam_name.split("_")[0]
+                            rgb_np = (rgb * 255).astype(np.uint8) if rgb.dtype == np.float32 else rgb.copy()
+                            cv2.imwrite(
+                                str(f"{args.debug_path}/frame_{frame_count:04d}_{cam_id}.png"),
+                                cv2.cvtColor(rgb_np[0], cv2.COLOR_RGB2BGR),
+                            )
+
+                    before_infer = _save_debug_frames
+
+                inference_response, _ = infer_openpi_step(
+                    client,
+                    camera_frames=camera_frames,
+                    target_image_size=args.target_image_size,
+                    base_payload=element,
+                    send_dsrl_raw_image=args.send_dsrl_raw_image,
+                    before_infer=before_infer,
                 )
 
                 # Get action predictions from OpenPI
                 # OpenPI outputs 32D (padded). We slice out the **effective** dims:
                 #   - diffik/osc: first 7D   (x, y, z, rx, ry, rz, gripper)
                 #   - hybrid/tactile: first 13D (x, y, z, rx, ry, rz, gripper, fL(3), fR(3))
-                action_chunk = client.infer(element)["actions"]
+                action_chunk = inference_response["actions"]
                 assert len(action_chunk) >= args.replan_steps, (
                     f"We want to replan every {args.replan_steps} steps, but policy only predicts"
                     f" {len(action_chunk)} steps."
@@ -959,6 +1177,7 @@ def run_closed_loop_policy(  # noqa: C901
 
                 # Execute inference actions
                 action = inference_actions
+                inference_chunks_taken += 1
 
                 # 仅在 debug_mode 1/2/3 时保存动作
                 if args.debug_mode in (1, 2, 3):
@@ -969,12 +1188,70 @@ def run_closed_loop_policy(  # noqa: C901
                 num_actions_to_execute = min(action.shape[0], args.replan_steps)
                 for i in range(num_actions_to_execute):
                     obs, reward, terminated, truncated, info = env.step(action[i].reshape([1, -1]))
+                    tactile_buf.append_control_sample(
+                        obs,
+                        env=env,
+                        include_tactile=args.control_mode in ("tactile", "binary"),
+                        env_id=0,
+                    )
+
+                    step_fL_pred = None
+                    step_fR_pred = None
+                    step_fL_meas = None
+                    step_fR_meas = None
+                    step_fL_meas_raw = None
+                    step_fR_meas_raw = None
+                    step_squeeze_pred = None
+                    step_squeeze_meas = None
+                    step_ap_pred = None
+                    step_ap_meas = None
+                    step_override_enabled = False
+                    step_target_contact_detected = False
+                    step_override_latched = False
+                    step_override_activation_step = None
+                    step_effective_single_finger_target = None
+                    step_effective_squeeze_target = None
+                    step_target_contact_force_norm = None
+                    step_gripper_pred = None
+                    step_gripper_cmd = None
+                    step_gripper_meas = None
+                    step_gripper_closed_limit = 0.0
+                    step_gripper_open_limit = _finite_float_or_none(
+                        getattr(env.unwrapped.cfg, "gripper_open_val", 0.04)
+                    )
+                    if step_gripper_open_limit is None:
+                        step_gripper_open_limit = 0.04
+                    step_gripper_lower_saturated = None
+                    step_gripper_upper_saturated = None
+                    step_reward_force = {
+                        "reward_grasp_observed": None,
+                        "reward_grasp_terms_active": [],
+                        "reward_grasp_started": False,
+                        "reward_force_valid_step": False,
+                        "reward_squeeze_meas_raw": None,
+                    }
+                    step_lift_state = {
+                        "target_object_height_m": None,
+                        "target_object_lift_delta_m": None,
+                        "target_object_above_lift_threshold": False,
+                        "target_object_lift_hold_count": 0,
+                        "target_object_lifted": False,
+                    }
 
                     # 若为 Hybrid 控制模式，则缓存 13D 动作以便后续计算 metrics
                     if args.control_mode in ("hybrid", "tactile"):
                         try:
                             if action[i].shape[-1] == 13:
                                 exp_actions_13d.append(action[i].detach().cpu())
+                                action_np = action[i].detach().cpu().numpy().astype(np.float32)
+                                step_fL_pred = _vector3_or_none(action_np[7:10])
+                                step_fR_pred = _vector3_or_none(action_np[10:13])
+                                pred_series = compute_contact_force_series_from_lr_forces(
+                                    fL=np.asarray([step_fL_pred], dtype=np.float32),
+                                    fR=np.asarray([step_fR_pred], dtype=np.float32),
+                                )
+                                step_squeeze_pred = _finite_float_or_none(pred_series.squeeze[0])
+                                step_ap_pred = _finite_float_or_none(pred_series.external_norm[0])
                         except Exception:
                             pass
 
@@ -986,24 +1263,131 @@ def run_closed_loop_policy(  # noqa: C901
                         debug = None
                     if debug:
                         try:
-                            f_sq_pred = float(debug.get("f_sq_pred", 0.0))
-                            f_sq_meas = float(debug.get("f_sq_meas", 0.0))
-                            exp_fsq_pred_sum += f_sq_pred
-                            exp_fsq_meas_sum += f_sq_meas
-                            exp_fsq_count += 1
-                            exp_fsq_pred_values.append(f_sq_pred)
-                            exp_fsq_meas_values.append(f_sq_meas)
+                            if debug.get("f_sq_pred") is not None:
+                                step_squeeze_pred = _finite_float_or_none(debug["f_sq_pred"])
+                                if step_squeeze_pred is not None:
+                                    exp_fsq_pred_values.append(step_squeeze_pred)
+                            if debug.get("f_sq_meas") is not None:
+                                step_squeeze_meas = _finite_float_or_none(debug["f_sq_meas"])
+                                if step_squeeze_meas is not None:
+                                    exp_fsq_meas_values.append(step_squeeze_meas)
 
                             # 加持力模长（在 base frame 下），用于 Ap 相关统计
                             ap_pred = debug.get("F_app_norm_pred", None)
                             ap_meas = debug.get("F_app_norm_meas", None)
                             try:
                                 if ap_pred is not None:
-                                    exp_ap_pred_values.append(float(ap_pred))
+                                    step_ap_pred = _finite_float_or_none(ap_pred)
+                                    if step_ap_pred is not None:
+                                        exp_ap_pred_values.append(step_ap_pred)
                                 if ap_meas is not None:
-                                    exp_ap_meas_values.append(float(ap_meas))
+                                    step_ap_meas = _finite_float_or_none(ap_meas)
+                                    if step_ap_meas is not None:
+                                        exp_ap_meas_values.append(step_ap_meas)
                             except Exception:
                                 pass
+
+                            step_fL_pred = _vector3_or_none(debug.get("fL_pred_local")) or step_fL_pred
+                            step_fR_pred = _vector3_or_none(debug.get("fR_pred_local")) or step_fR_pred
+                            step_fL_meas = _vector3_or_none(debug.get("fL_meas_local"))
+                            step_fR_meas = _vector3_or_none(debug.get("fR_meas_local"))
+                            step_fL_meas_raw = _vector3_or_none(
+                                debug.get("fL_meas_local_raw")
+                            ) or step_fL_meas
+                            step_fR_meas_raw = _vector3_or_none(
+                                debug.get("fR_meas_local_raw")
+                            ) or step_fR_meas
+                            if step_fL_meas is not None and step_fR_meas is not None:
+                                exp_fL_meas_values.append(np.asarray(step_fL_meas, dtype=np.float32))
+                                exp_fR_meas_values.append(np.asarray(step_fR_meas, dtype=np.float32))
+
+                            step_override_enabled = bool(
+                                _bool_or_none(
+                                    debug.get("target_contact_override_enabled")
+                                )
+                            )
+                            step_target_contact_detected = bool(
+                                _bool_or_none(debug.get("target_contact_detected"))
+                            )
+                            step_override_latched = bool(
+                                _bool_or_none(
+                                    debug.get(
+                                        "target_contact_override_latched"
+                                    )
+                                )
+                            )
+                            step_override_activation_step = _integer_or_none(
+                                debug.get("target_contact_activation_step")
+                            )
+                            step_effective_single_finger_target = (
+                                _finite_float_or_none(
+                                    debug.get(
+                                        "target_contact_single_finger_target"
+                                    )
+                                )
+                            )
+                            step_effective_squeeze_target = _finite_float_or_none(
+                                debug.get("target_contact_squeeze_target")
+                            )
+                            step_gripper_pred = _finite_float_or_none(
+                                debug.get("d_pred")
+                            )
+                            step_gripper_cmd = _finite_float_or_none(
+                                debug.get("d_cmd")
+                            )
+                            step_gripper_meas = _finite_float_or_none(
+                                debug.get("d_actual")
+                            )
+                            if step_gripper_cmd is not None:
+                                step_gripper_lower_saturated = bool(
+                                    step_gripper_cmd
+                                    <= step_gripper_closed_limit + 1.0e-8
+                                )
+                                step_gripper_upper_saturated = bool(
+                                    step_gripper_cmd
+                                    >= step_gripper_open_limit - 1.0e-8
+                                )
+                            step_target_contact_force_norm = _finite_float_or_none(
+                                debug.get("target_contact_force_norm")
+                            )
+
+                            if step_override_enabled:
+                                exp_override_configured = True
+                                exp_override_single_finger_target_n = (
+                                    _finite_float_or_none(
+                                        debug.get(
+                                            "target_contact_configured_single_finger_force"
+                                        )
+                                    )
+                                )
+                                exp_override_squeeze_target_n = (
+                                    _finite_float_or_none(
+                                        debug.get(
+                                            "target_contact_configured_squeeze_force"
+                                        )
+                                    )
+                                )
+                                exp_override_contact_steps += int(
+                                    step_target_contact_detected
+                                )
+                                if step_override_latched:
+                                    exp_override_activated = True
+                                    exp_override_active_steps += 1
+                                    if (
+                                        step_override_activation_step is not None
+                                        and step_override_activation_step >= 0
+                                    ):
+                                        exp_override_activation_step = (
+                                            step_override_activation_step
+                                        )
+                                    if step_fL_meas is not None:
+                                        exp_override_left_normal_abs.append(
+                                            abs(float(step_fL_meas[2]))
+                                        )
+                                    if step_fR_meas is not None:
+                                        exp_override_right_normal_abs.append(
+                                            abs(float(step_fR_meas[2]))
+                                        )
                         except Exception:
                             pass
                     elif args.control_mode == "binary":
@@ -1026,41 +1410,256 @@ def run_closed_loop_policy(  # noqa: C901
                                 fL=np.asarray([f_left], dtype=np.float32),
                                 fR=np.asarray([f_right], dtype=np.float32),
                             )
-                            squeeze_meas = float(series.squeeze[0])
-                            ap_meas = float(series.external_norm[0])
+                            squeeze_meas = _finite_float_or_none(series.squeeze[0])
+                            ap_meas = _finite_float_or_none(series.external_norm[0])
 
                             # pred placeholders (0.0) for log/regex compatibility
                             squeeze_pred = 0.0
                             ap_pred = 0.0
 
-                            exp_fsq_pred_sum += squeeze_pred
-                            exp_fsq_meas_sum += squeeze_meas
-                            exp_fsq_count += 1
                             exp_fsq_pred_values.append(squeeze_pred)
-                            exp_fsq_meas_values.append(squeeze_meas)
+                            if squeeze_meas is not None:
+                                exp_fsq_meas_values.append(squeeze_meas)
 
                             exp_ap_pred_values.append(ap_pred)
-                            exp_ap_meas_values.append(ap_meas)
+                            if ap_meas is not None:
+                                exp_ap_meas_values.append(ap_meas)
+
+                            step_squeeze_pred = squeeze_pred
+                            step_squeeze_meas = squeeze_meas
+                            step_ap_pred = ap_pred
+                            step_ap_meas = ap_meas
+                            step_fL_meas = _vector3_or_none(f_left)
+                            step_fR_meas = _vector3_or_none(f_right)
+                            step_fL_meas_raw = step_fL_meas
+                            step_fR_meas_raw = step_fR_meas
 
                             # Keep raw 3D forces for strict per-episode metrics aggregation.
-                            exp_fL_meas_values.append(np.asarray(f_left, dtype=np.float32))
-                            exp_fR_meas_values.append(np.asarray(f_right, dtype=np.float32))
+                            if step_fL_meas is not None and step_fR_meas is not None:
+                                exp_fL_meas_values.append(np.asarray(step_fL_meas, dtype=np.float32))
+                                exp_fR_meas_values.append(np.asarray(step_fR_meas, dtype=np.float32))
                         except Exception:
                             # If force obs is missing, skip silently (do not break main loop).
                             pass
 
-                        # debug_mode=4: 在线更新 Hybrid 力–位混合可视化
-                        if force_viz is not None and args.debug_mode == 4:
-                            try:
-                                force_viz.update(debug)
-                            except Exception:
-                                # 可视化失败不应中断主流程
-                                pass
+                    # debug_mode=4: 在线更新 Hybrid 力–位混合可视化
+                    if force_viz is not None and args.debug_mode == 4:
+                        try:
+                            force_viz.update(debug)
+                        except Exception:
+                            # 可视化失败不应中断主流程
+                            pass
+
+                    if trajectory_force_error is None:
+                        try:
+                            if (
+                                step_fL_meas_raw is None
+                                or step_fR_meas_raw is None
+                            ):
+                                policy_obs = obs.get("policy", {})
+                                gnf = policy_obs.get("gripper_net_force")
+                                if gnf is None:
+                                    raise RuntimeError(
+                                        "current raw gripper force is unavailable"
+                                    )
+                                if isinstance(gnf, torch.Tensor):
+                                    gnf = gnf.detach().cpu().numpy()
+                                force_history = np.asarray(gnf, dtype=np.float32)
+                                if (
+                                    force_history.ndim != 4
+                                    or force_history.shape[0] != 1
+                                    or force_history.shape[2:] != (2, 3)
+                                    or force_history.shape[1] < 1
+                                ):
+                                    raise RuntimeError(
+                                        "gripper_net_force must have shape "
+                                        f"(1, H>=1, 2, 3), got {force_history.shape}"
+                                    )
+                                force_lr_raw = force_history[0, -1]
+                                step_fL_meas_raw = _vector3_or_none(
+                                    force_lr_raw[0]
+                                )
+                                step_fR_meas_raw = _vector3_or_none(
+                                    force_lr_raw[1]
+                                )
+                            if (
+                                step_fL_meas_raw is None
+                                or step_fR_meas_raw is None
+                            ):
+                                raise RuntimeError(
+                                    "raw gripper force contains invalid values"
+                                )
+
+                            grasp_observations = (
+                                env.unwrapped.observation_manager.compute_group(
+                                    "subtask_terms", update_history=False
+                                )
+                            )
+                            if not isinstance(grasp_observations, dict):
+                                raise RuntimeError(
+                                    "subtask_terms observations are not a dictionary"
+                                )
+                            if trajectory_force_tracker is None:
+                                grasp_term_names = sorted(
+                                    name
+                                    for name in grasp_observations
+                                    if name.startswith("grasp_")
+                                )
+                                trajectory_force_tracker = TrajectoryForceTracker(
+                                    grasp_term_names,
+                                    contact_epsilon_n=(
+                                        args.reward_force_contact_epsilon_n
+                                    ),
+                                    min_valid_samples=(
+                                        args.reward_force_min_valid_samples
+                                    ),
+                                )
+                            step_reward_force = trajectory_force_tracker.update(
+                                step_index=total_steps_taken,
+                                grasp_observations=grasp_observations,
+                                force_lr_raw=np.asarray(
+                                    [step_fL_meas_raw, step_fR_meas_raw],
+                                    dtype=np.float32,
+                                ),
+                            )
+                        except Exception as exc:
+                            trajectory_force_error = str(exc)
+                            print(
+                                "[Trajectory-Force] Failed to update reward-aligned "
+                                f"metric for experiment {exp_idx}: {exc}"
+                            )
+
+                    exp_tracking_reward_valid.append(
+                        bool(step_reward_force["reward_force_valid_step"])
+                    )
+                    exp_tracking_squeeze_pred.append(step_squeeze_pred)
+                    exp_tracking_squeeze_target_eff.append(
+                        step_effective_squeeze_target
+                    )
+                    exp_tracking_squeeze_meas_raw.append(
+                        step_reward_force["reward_squeeze_meas_raw"]
+                    )
+                    exp_tracking_gripper_pred.append(step_gripper_pred)
+                    exp_tracking_gripper_cmd.append(step_gripper_cmd)
+
+                    if lift_tracker is not None and lift_object is not None:
+                        object_height_m = float(
+                            lift_object.data.root_pos_w[0, 2]
+                            .detach()
+                            .cpu()
+                            .item()
+                        )
+                        step_lift_state = lift_tracker.update(
+                            step_index=total_steps_taken,
+                            object_height_m=object_height_m,
+                            contact_latched=step_override_latched,
+                        )
 
                     total_steps_taken += 1
 
+                    if args.step_trace_path is not None:
+                        exp_step_trace_rows.append(
+                            {
+                                "schema_version": 3,
+                                "task_suite": args.task_suite,
+                                "task_id": int(args.task_id),
+                                "experiment_index": int(exp_idx),
+                                "hdf5_episode_index": dataset_episode_index,
+                                "env_step_index": int(total_steps_taken - 1),
+                                "inference_chunk_index": int(action_idx),
+                                "action_in_chunk_index": int(i),
+                                "fL_pred_local": step_fL_pred,
+                                "fR_pred_local": step_fR_pred,
+                                "fL_meas_local": step_fL_meas,
+                                "fR_meas_local": step_fR_meas,
+                                "squeeze_pred": step_squeeze_pred,
+                                "squeeze_meas": step_squeeze_meas,
+                                "ap_pred": step_ap_pred,
+                                "ap_meas": step_ap_meas,
+                                "predicted_contact": _contact_or_none(step_fL_pred, step_fR_pred),
+                                "measured_contact": _contact_or_none(step_fL_meas, step_fR_meas),
+                                "target_contact_override_enabled": step_override_enabled,
+                                "target_contact_detected": step_target_contact_detected,
+                                "target_contact_override_latched": step_override_latched,
+                                "target_contact_activation_step": step_override_activation_step,
+                                "target_contact_force_norm": step_target_contact_force_norm,
+                                "effective_single_finger_target_n": step_effective_single_finger_target,
+                                "effective_squeeze_target_n": step_effective_squeeze_target,
+                                "gripper_pred_m": step_gripper_pred,
+                                "gripper_cmd_m": step_gripper_cmd,
+                                "gripper_meas_m": step_gripper_meas,
+                                "gripper_closed_limit_m": step_gripper_closed_limit,
+                                "gripper_open_limit_m": step_gripper_open_limit,
+                                "gripper_lower_saturated": step_gripper_lower_saturated,
+                                "gripper_upper_saturated": step_gripper_upper_saturated,
+                                **step_reward_force,
+                                **step_lift_state,
+                            }
+                        )
+
+                    if episode_video is not None:
+                        try:
+                            video_frames: list[tuple[str, np.ndarray]] = []
+                            for camera_name in args.camera_names:
+                                camera = env.unwrapped.scene[camera_name]
+                                rgb = camera.data.output["rgb"][0]
+                                video_frames.append(
+                                    (camera_name, _to_uint8_rgb(rgb))
+                                )
+                            left_normal = (
+                                abs(float(step_fL_meas[2]))
+                                if step_fL_meas is not None
+                                else float("nan")
+                            )
+                            right_normal = (
+                                abs(float(step_fR_meas[2]))
+                                if step_fR_meas is not None
+                                else float("nan")
+                            )
+                            lift_delta = step_lift_state[
+                                "target_object_lift_delta_m"
+                            ]
+                            lift_delta_text = (
+                                f"{float(lift_delta):.3f}"
+                                if lift_delta is not None
+                                else "N/A"
+                            )
+                            episode_video.write(
+                                video_frames,
+                                [
+                                    f"episode={exp_idx:03d} step={total_steps_taken - 1}",
+                                    (
+                                        "target_contact="
+                                        f"{int(step_target_contact_detected)} "
+                                        f"latched={int(step_override_latched)}"
+                                    ),
+                                    (
+                                        "target_single="
+                                        f"{step_effective_single_finger_target!s} N "
+                                        "meas_abs_z="
+                                        f"({left_normal:.2f},{right_normal:.2f}) N"
+                                    ),
+                                    (
+                                        f"lift_delta={lift_delta_text} m "
+                                        "lifted="
+                                        f"{int(step_lift_state['target_object_lifted'])}"
+                                    ),
+                                ],
+                            )
+                        except Exception as exc:
+                            episode_video.error = str(exc)
+
                     if terminated[0] or truncated[0]:
                         experiment_success = False
+                        end_reason, terminal_term = resolve_episode_termination(
+                            info=info,
+                            terminated=bool(terminated[0]),
+                            truncated=bool(truncated[0]),
+                        )
+                        damage_details = extract_object_damage_details(
+                            info=info,
+                            terminal_term=terminal_term,
+                        )
                         break
 
                     if success_term is not None:
@@ -1068,6 +1667,7 @@ def run_closed_loop_policy(  # noqa: C901
                             success_step_count += 1
                             if success_step_count >= args.num_success_steps:
                                 experiment_success = True
+                                end_reason = "success"
                                 break
                         else:
                             success_step_count = 0
@@ -1104,38 +1704,67 @@ def run_closed_loop_policy(  # noqa: C901
                                     continue
 
                             # --- Scalars (pred/meas) ---
-                            # gripper_cmd: from executed action (1D)
-                            # gripper_meas: from obs["policy"]["gripper_pos"] (2,) -> mean (1D)
+                            # Gripper position semantics for force-position control:
+                            # - pred: raw policy d_pred before force correction/clamping
+                            # - cmd: controller-corrected and clamped d_cmd actually sent to both joints
+                            # - meas: mean of the two raw finger joint positions after env.step()
+                            # Do not average obs["policy"]["gripper_pos"] here: that observation
+                            # contains [q_left, -q_right], whose mean is a signed asymmetry rather
+                            # than a gripper opening position.
+                            gripper_pred = None
                             gripper_cmd = None
                             gripper_meas = None
+                            gripper_joint_left = None
+                            gripper_joint_right = None
 
                             # squeeze_pred: prefer ForcePositionAction.debug_info if available, else derive from 13D action forces
                             # squeeze_meas: prefer ForcePositionAction.debug_info if available, else derive from obs["policy"]["gripper_net_force"]
                             squeeze_pred = None
                             squeeze_meas = None
 
-                            # commanded gripper position from executed action (shape depends on control_mode)
+                            # Raw model prediction from the executed action. This is retained for
+                            # audit, but the video command curve uses the final controller d_cmd.
                             try:
                                 a_np = action[i].detach().cpu().numpy().astype(np.float32)
                                 # - hybrid/tactile: 13D => gripper at index 6
                                 # - diffik/osc/binary: 8D => gripper at index 7
                                 if a_np.shape[-1] >= 13:
-                                    gripper_cmd = float(a_np[6])
+                                    gripper_pred = float(a_np[6])
                                 elif a_np.shape[-1] >= 8:
-                                    gripper_cmd = float(a_np[7])
+                                    gripper_pred = float(a_np[7])
                                 elif a_np.shape[-1] >= 7:
-                                    gripper_cmd = float(a_np[6])
+                                    gripper_pred = float(a_np[6])
                             except Exception:
                                 pass
 
-                            # measured gripper position and measured squeeze from policy obs
+                            # Controller command and raw joint measurements. ForcePositionAction
+                            # exposes these values after applying the current env step.
+                            try:
+                                if debug:
+                                    debug_gripper_pred = _finite_float_or_none(
+                                        debug.get("d_pred")
+                                    )
+                                    if debug_gripper_pred is not None:
+                                        gripper_pred = debug_gripper_pred
+                                    gripper_cmd = _finite_float_or_none(
+                                        debug.get("d_cmd")
+                                    )
+                                    gripper_meas = _finite_float_or_none(
+                                        debug.get("d_actual")
+                                    )
+                                    gripper_joint_left = _finite_float_or_none(
+                                        debug.get("d_actual_left")
+                                    )
+                                    gripper_joint_right = _finite_float_or_none(
+                                        debug.get("d_actual_right")
+                                    )
+                            except Exception:
+                                pass
+
+                            # Measured squeeze from policy obs; gripper position intentionally
+                            # does not use the signed gripper_pos observation.
                             try:
                                 policy_obs = obs.get("policy", {}) if isinstance(obs, dict) else {}
-                                gp = policy_obs.get("gripper_pos", None)
-                                if gp is not None:
-                                    gp0 = gp[0].detach().cpu().numpy().astype(np.float32).reshape(-1)
-                                    if gp0.size > 0:
-                                        gripper_meas = float(np.mean(gp0))
                                 gnf = policy_obs.get("gripper_net_force", None)
                                 if gnf is not None:
                                     f_lr = gnf[0, 0].detach().cpu().numpy().astype(np.float32)  # (2,3)
@@ -1178,10 +1807,20 @@ def run_closed_loop_policy(  # noqa: C901
                                 "action_idx": int(action_idx),
                                 "replan_i": int(i),
                                 "frame": int(frame_count),
+                                "mode6_scalar_schema_version": 3,
+                                "gripper_pred": gripper_pred,
                                 "gripper_cmd": gripper_cmd,
                                 "gripper_meas": gripper_meas,
+                                "gripper_joint_left": gripper_joint_left,
+                                "gripper_joint_right": gripper_joint_right,
                                 "squeeze_pred": squeeze_pred,
+                                "squeeze_target_eff": step_effective_squeeze_target,
                                 "squeeze_meas": squeeze_meas,
+                                "squeeze_meas_raw": step_reward_force[
+                                    "reward_squeeze_meas_raw"
+                                ],
+                                "gripper_lower_saturated": step_gripper_lower_saturated,
+                                "gripper_upper_saturated": step_gripper_upper_saturated,
                             }
                             mode6_force_fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
                         except Exception:
@@ -1215,100 +1854,196 @@ def run_closed_loop_policy(  # noqa: C901
                 if experiment_success:
                     successful_experiments += 1
                     current_sr = (successful_experiments / (exp_idx + 1)) * 100
-
-                    # 累加当前成功 experiment 的平均挤压力
-                    if exp_fsq_count > 0:
-                        avg_pred = exp_fsq_pred_sum / exp_fsq_count
-                        avg_meas = exp_fsq_meas_sum / exp_fsq_count
-                        succ_squeeze_pred_sum += avg_pred
-                        succ_squeeze_meas_sum += avg_meas
-                        succ_squeeze_count += 1
+                    if exp_fsq_pred_values and exp_fsq_meas_values:
+                        avg_pred = float(np.mean(exp_fsq_pred_values))
+                        avg_meas = float(np.mean(exp_fsq_meas_values))
                         print(
                             f"✓ Success | Current SR: {successful_experiments}/{exp_idx + 1} ({current_sr:.1f}%) "
                             f"| squeeze_pred={avg_pred:.4f}, squeeze_meas={avg_meas:.4f}"
                         )
                     else:
                         print(f"✓ Success | Current SR: {successful_experiments}/{exp_idx + 1} ({current_sr:.1f}%)")
-
-                    # Binary mode: record measured squeeze/apply metrics (no predicted forces).
-                    # We compute Top5% stats from per-step measured sequences to mirror hybrid reporting.
-                    if args.control_mode == "binary":
-                        # Strict: reuse metrics.py aggregation on the per-step LR force series.
-                        try:
-                            if exp_fL_meas_values and exp_fR_meas_values:
-                                fL = np.stack(exp_fL_meas_values, axis=0)  # (T,3)
-                                fR = np.stack(exp_fR_meas_values, axis=0)  # (T,3)
-                                meas_metrics = compute_contact_force_metrics_from_lr_forces(fL, fR)
-
-                                # Fill the "pred-style" metrics slots with measured metrics in binary mode
-                                # (there is no force prediction in this control mode).
-                                succ_metrics_count += 1
-                                succ_squeeze_max_sum += float(meas_metrics.squeeze_max)
-                                succ_app_max_sum += float(meas_metrics.external_norm_max)
-                                succ_app_mean_sum += float(meas_metrics.external_norm_mean)
-
-                                # Also populate measured aggregates (same definitions).
-                                succ_squeeze_max_meas_sum += float(meas_metrics.squeeze_max)
-                                succ_squeeze_max_meas_count += 1
-                                succ_ap_mean_meas_sum += float(meas_metrics.external_norm_mean)
-                                succ_ap_mean_meas_count += 1
-                                succ_ap_max_meas_sum += float(meas_metrics.external_norm_max)
-                                succ_ap_max_meas_count += 1
-                        except Exception:
-                            pass
-
-                    # 若为 Hybrid 控制模式且缓存到了 13D 动作，则为该成功 experiment 计算一次力学 metrics
-                    if args.control_mode in ("hybrid", "tactile") and exp_actions_13d:
-                        try:
-                            actions_13d = torch.stack(exp_actions_13d, dim=0).numpy()  # (T, 13)
-                            metrics = compute_contact_force_metrics_from_13d(actions_13d)
-                            succ_metrics_count += 1
-                            # squeeze_max / external_norm_max 已在 metrics.py 中按 Top5% 帧均值定义
-                            succ_squeeze_max_sum += metrics.squeeze_max
-                            succ_app_max_sum += metrics.external_norm_max
-                            succ_app_mean_sum += metrics.external_norm_mean
-
-                            # 统计当前成功 experiment 的「实测」挤压力 / 加持力指标
-                            # 1) 实测挤压力 Top5% 最大值（均值）
-                            sq_max_meas_top5 = compute_topk_mean(exp_fsq_meas_values, frac=0.05)
-                            if sq_max_meas_top5 is not None:
-                                succ_squeeze_max_meas_sum += sq_max_meas_top5
-                                succ_squeeze_max_meas_count += 1
-
-                            # 2) 实测加持力平均值（直接在该 demo 内求均值）
-                            if exp_ap_meas_values:
-                                ap_mean_meas = float(np.mean(exp_ap_meas_values))
-                                succ_ap_mean_meas_sum += ap_mean_meas
-                                succ_ap_mean_meas_count += 1
-
-                            # 3) 实测加持力 Top5% 最大值（均值）
-                            ap_max_meas_top5 = compute_topk_mean(exp_ap_meas_values, frac=0.05)
-                            if ap_max_meas_top5 is not None:
-                                succ_ap_max_meas_sum += ap_max_meas_top5
-                                succ_ap_max_meas_count += 1
-
-                            print(
-                                "    [Hybrid-Metrics] "
-                                f"squeeze_max={metrics.squeeze_max:.4f}, "
-                                f"squeeze_mean={metrics.squeeze_mean:.4f}, "
-                                f"app_max={metrics.external_norm_max:.4f}, "
-                                f"app_mean={metrics.external_norm_mean:.4f}"
-                            )
-                        except Exception:
-                            # metrics 计算失败不影响主流程
-                            pass
-
                     break
 
                 # Check if we broke out of inner loop due to unexpected termination
-                if i < args.replan_steps - 1 and (terminated[0] or truncated[0]):
+                if terminated[0] or truncated[0]:
                     current_sr = (successful_experiments / (exp_idx + 1)) * 100
-                    print(f"✗ Failed (terminated) | Current SR: {successful_experiments}/{exp_idx + 1} ({current_sr:.1f}%)")
+                    print(
+                        f"✗ Failed ({end_reason}) | Current SR: "
+                        f"{successful_experiments}/{exp_idx + 1} ({current_sr:.1f}%)"
+                    )
                     break
 
                 if action_idx >= args.max_inference_steps - 1:
                     current_sr = (successful_experiments / (exp_idx + 1)) * 100
                     print(f"✗ Failed (max steps) | Current SR: {successful_experiments}/{exp_idx + 1} ({current_sr:.1f}%)")
+
+            if args.control_mode in ("hybrid", "tactile"):
+                force_mode = "full"
+            elif args.control_mode == "binary":
+                force_mode = "measured_only"
+            else:
+                force_mode = "not_applicable"
+
+            force_summary = summarize_episode_force_metrics(
+                force_mode=force_mode,
+                env_steps=total_steps_taken,
+                actions_13d=exp_actions_13d,
+                squeeze_pred_values=exp_fsq_pred_values,
+                squeeze_meas_values=exp_fsq_meas_values,
+                ap_pred_values=exp_ap_pred_values,
+                ap_meas_values=exp_ap_meas_values,
+                fL_meas_values=exp_fL_meas_values,
+                fR_meas_values=exp_fR_meas_values,
+            )
+            if trajectory_force_tracker is not None:
+                trajectory_force_summary = trajectory_force_tracker.summary()
+            else:
+                trajectory_force_summary = {
+                    "trajectory_mean_measured_squeeze": None,
+                    "trajectory_force_valid_samples": 0,
+                    "trajectory_force_status": "unavailable",
+                    "trajectory_force_error": None,
+                    "grasp_started": False,
+                    "grasp_start_step": None,
+                }
+            if trajectory_force_error is not None:
+                trajectory_force_summary["trajectory_force_status"] = "error"
+                trajectory_force_summary["trajectory_force_error"] = (
+                    trajectory_force_error
+                )
+
+            try:
+                force_tracking_summary = summarize_force_tracking_metrics(
+                    expected_steps=total_steps_taken,
+                    reward_valid_steps=exp_tracking_reward_valid,
+                    predicted_squeeze_values=exp_tracking_squeeze_pred,
+                    effective_squeeze_target_values=(
+                        exp_tracking_squeeze_target_eff
+                    ),
+                    measured_squeeze_raw_values=(
+                        exp_tracking_squeeze_meas_raw
+                    ),
+                    gripper_pred_values=exp_tracking_gripper_pred,
+                    gripper_cmd_values=exp_tracking_gripper_cmd,
+                    gripper_closed_limit_m=0.0,
+                    gripper_open_limit_m=float(
+                        getattr(env.unwrapped.cfg, "gripper_open_val", 0.04)
+                    ),
+                )
+            except Exception as exc:
+                force_tracking_summary = {
+                    "status": "error",
+                    "error": str(exc),
+                }
+
+            def _mean_or_none(values: list[float]) -> float | None:
+                return float(np.mean(values)) if values else None
+
+            force_override_summary = {
+                "configured": bool(exp_override_configured),
+                "activated": bool(exp_override_activated),
+                "activation_step": exp_override_activation_step,
+                "active_steps": int(exp_override_active_steps),
+                "target_contact_steps": int(exp_override_contact_steps),
+                "single_finger_target_n": exp_override_single_finger_target_n,
+                "squeeze_target_n": exp_override_squeeze_target_n,
+                "left_normal_abs_avg_n": _mean_or_none(
+                    exp_override_left_normal_abs
+                ),
+                "right_normal_abs_avg_n": _mean_or_none(
+                    exp_override_right_normal_abs
+                ),
+                "left_normal_abs_top5_n": (
+                    compute_topk_mean(exp_override_left_normal_abs, frac=0.05)
+                    if exp_override_left_normal_abs
+                    else None
+                ),
+                "right_normal_abs_top5_n": (
+                    compute_topk_mean(exp_override_right_normal_abs, frac=0.05)
+                    if exp_override_right_normal_abs
+                    else None
+                ),
+            }
+            lift_summary = (
+                lift_tracker.summary()
+                if lift_tracker is not None
+                else {
+                    "enabled": False,
+                    "target_object": None,
+                    "initial_height_m": None,
+                    "max_height_m": None,
+                    "max_height_delta_m": None,
+                    "height_threshold_m": float(args.lift_height_threshold_m),
+                    "hold_steps_required": int(args.lift_hold_steps),
+                    "above_threshold_steps": 0,
+                    "max_consecutive_above_threshold_steps": 0,
+                    "first_above_threshold_step": None,
+                    "lift_confirmed_step": None,
+                    "lifted": False,
+                }
+            )
+
+            if episode_video is not None:
+                video_summary = episode_video.finalize(
+                    success=experiment_success,
+                    end_reason=end_reason,
+                    expected_frames=total_steps_taken,
+                )
+            else:
+                video_summary = {
+                    "enabled": False,
+                    "status": "disabled",
+                    "path": None,
+                    "frames": 0,
+                    "fps": None,
+                    "error": None,
+                }
+
+            trace_status = "disabled"
+            trace_rows_written = 0
+            trace_error = step_trace_open_error
+            if args.step_trace_path is not None:
+                trace_status = "partial"
+                if step_trace_fh is not None:
+                    try:
+                        for trace_row in exp_step_trace_rows:
+                            step_trace_fh.write(json.dumps(trace_row, ensure_ascii=False, separators=(",", ":")) + "\n")
+                            trace_rows_written += 1
+                        step_trace_fh.flush()
+                        if trace_rows_written == total_steps_taken:
+                            trace_status = "complete"
+                        else:
+                            trace_error = (
+                                f"trace rows {trace_rows_written} do not match env_steps {total_steps_taken}"
+                            )
+                    except Exception as exc:
+                        trace_error = str(exc)
+                        print(f"[Step-Trace] Failed while writing experiment {exp_idx}: {exc}")
+
+            episode_record = {
+                "experiment_index": int(exp_idx),
+                "hdf5_episode_index": dataset_episode_index,
+                "success": bool(experiment_success),
+                "end_reason": end_reason,
+                "terminal_term": terminal_term,
+                "object_damage": damage_details,
+                "damage_threshold": damage_threshold_snapshot,
+                "friction": friction_snapshot,
+                "env_steps": int(total_steps_taken),
+                "inference_chunks": int(inference_chunks_taken),
+                **force_summary,
+                **trajectory_force_summary,
+                "force_tracking": force_tracking_summary,
+                "force_override": force_override_summary,
+                "lift": lift_summary,
+                "video": video_summary,
+                "trace_status": trace_status,
+                "trace_rows": int(trace_rows_written),
+                "trace_error": trace_error,
+            }
+            episode_metrics_records.append(episode_record)
+            print("[Episode-Metrics] " + json.dumps(episode_record, ensure_ascii=False, separators=(",", ":")))
 
             # debug_mode=5: 每个 experiment 结束后落盘一份逐帧挤压力序列
             if force_dump_dir is not None:
@@ -1347,69 +2082,74 @@ def run_closed_loop_policy(  # noqa: C901
             except Exception:
                 pass
 
+    if step_trace_fh is not None:
+        try:
+            step_trace_fh.close()
+        except Exception:
+            pass
+
     success_rate = (successful_experiments / args.num_total_experiments) * 100
     print("\nEvaluation Results:")
     print(f"Total experiments: {args.num_total_experiments}")
     print(f"Successful experiments: {successful_experiments}")
     print(f"Success rate: {success_rate:.2f}%")
 
-    # 1) 挤压力平均值（预测 / 实测）——仅用于后续 metrics 行中输出
-    task_avg_pred = None
-    task_avg_meas = None
-    if succ_squeeze_count > 0:
-        task_avg_pred = succ_squeeze_pred_sum / succ_squeeze_count
-        task_avg_meas = succ_squeeze_meas_sum / succ_squeeze_count
-
-        # Keep backward-compatible line for scripts/tools/run_task_evaluations.py parser.
-        if args.control_mode in ("hybrid", "tactile", "binary"):
-            print(
-                f"[Hybrid] Task avg squeeze_pred={task_avg_pred:.4f}, squeeze_meas={task_avg_meas:.4f} "
-                f"over {succ_squeeze_count} successes"
-            )
-
-    # 2) Top5% 最大挤压力 / 最大加持力 + 平均加持力（预测 / 实测）——统一在 Hybrid-Metrics 一行输出
-    if succ_metrics_count > 0:
-        task_squeeze_max_mean = succ_squeeze_max_sum / succ_metrics_count
-        task_app_max_mean = succ_app_max_sum / succ_metrics_count
-        task_app_mean_mean = succ_app_mean_sum / succ_metrics_count
-
-        # 实测挤压力 / 加持力（若有）
-        task_squeeze_max_meas_mean = (
-            succ_squeeze_max_meas_sum / succ_squeeze_max_meas_count
-            if succ_squeeze_max_meas_count > 0
-            else None
+    force_aggregates, force_metric_counts = aggregate_success_force_metrics(episode_metrics_records)
+    trajectory_force_aggregates = summarize_trajectory_force_metrics(
+        episode_metrics_records
+    )
+    success_trajectory_force = trajectory_force_aggregates[
+        "success_trajectory_mean_measured_squeeze"
+    ]
+    success_trajectory_force_count = trajectory_force_aggregates[
+        "success_trajectory_force_episode_count"
+    ]
+    if success_trajectory_force is not None:
+        print(
+            "[Trajectory-Force] Task reward_aligned "
+            f"success_trajectory_mean_measured_squeeze={success_trajectory_force:.4f} "
+            f"over {success_trajectory_force_count} eligible successes"
         )
-        task_ap_mean_meas_mean = (
-            succ_ap_mean_meas_sum / succ_ap_mean_meas_count if succ_ap_mean_meas_count > 0 else None
-        )
-        task_ap_max_meas_mean = (
-            succ_ap_max_meas_sum / succ_ap_max_meas_count if succ_ap_max_meas_count > 0 else None
+    task_avg_pred = force_aggregates["squeeze_avg_pred"]
+    task_avg_meas = force_aggregates["squeeze_avg_meas"]
+    if task_avg_pred is not None and task_avg_meas is not None:
+        print(
+            f"[Hybrid] Task avg squeeze_pred={task_avg_pred:.4f}, squeeze_meas={task_avg_meas:.4f} "
+            f"over {force_metric_counts['squeeze_avg_pred']} successes"
         )
 
+    contact_metric_count = max(
+        force_metric_counts["squeeze_max_pred"],
+        force_metric_counts["squeeze_max_meas"],
+        force_metric_counts["ap_avg_pred"],
+        force_metric_counts["ap_avg_meas"],
+        force_metric_counts["ap_max_pred"],
+        force_metric_counts["ap_max_meas"],
+    )
+    if contact_metric_count > 0:
         fragments: list[str] = []
         if task_avg_pred is not None:
             fragments.append(f"squeeze_avg_pred={task_avg_pred:.4f}")
         if task_avg_meas is not None:
             fragments.append(f"squeeze_avg_meas={task_avg_meas:.4f}")
 
-        fragments.extend(
-            [
-                f"squeeze_max_mean={task_squeeze_max_mean:.4f}",
-                f"app_max_mean={task_app_max_mean:.4f}",
-                f"app_mean_mean={task_app_mean_mean:.4f}",
-            ]
-        )
-        if task_squeeze_max_meas_mean is not None:
-            fragments.append(f"squeeze_max_meas_mean={task_squeeze_max_meas_mean:.4f}")
-        if task_ap_max_meas_mean is not None:
-            fragments.append(f"ap_max_meas_mean={task_ap_max_meas_mean:.4f}")
-        if task_ap_mean_meas_mean is not None:
-            fragments.append(f"ap_mean_meas_mean={task_ap_mean_meas_mean:.4f}")
+        output_key_map = {
+            "squeeze_max_pred": "squeeze_max_mean",
+            "ap_max_pred": "app_max_mean",
+            "ap_avg_pred": "app_mean_mean",
+            "squeeze_max_meas": "squeeze_max_meas_mean",
+            "ap_max_meas": "ap_max_meas_mean",
+            "ap_avg_meas": "ap_mean_meas_mean",
+        }
+        for metric_key, output_key in output_key_map.items():
+            value = force_aggregates[metric_key]
+            if value is not None:
+                fragments.append(f"{output_key}={value:.4f}")
 
         print(
             "[Hybrid-Metrics] Task contact_metrics "
             + ", ".join(fragments)
-            + f" over {succ_metrics_count} successes"
+            + f" over {contact_metric_count} successes"
         )
     # 关闭 Hybrid 力–位可视化窗口
     if force_viz is not None:
