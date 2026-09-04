@@ -53,6 +53,11 @@ from benchmarks.common.metrics import (
     compute_topk_mean,
 )
 from benchmarks.openpi.openpi_payload import infer_openpi_step
+from benchmarks.openpi.activeforcing_runtime import (
+    ActiveForcingExecutor,
+    JsonTargetForceModel,
+    ResponseTargetForceModel,
+)
 
 TARGET_IMAGE_HW = (224, 224)
 
@@ -383,6 +388,13 @@ class OpenpiClientArguments(ClosedLoopArguments):
     #       (x, y, z, rx, ry, rz, gripper, fL(3), fR(3))  -- no zero padding on the client side
     control_mode: str = "diffik"
     task: str = ""  # Will be auto-set based on control_mode if not provided
+
+    # ActiveForcing is an explicit opt-in. When enabled, the model must emit
+    # target_force_n alongside the OpenPI action response; the action chunk is
+    # still executed unchanged through native Tabero ForcePositionAction.
+    activeforcing_enabled: bool = False
+    activeforcing_decision_path: Optional[Path] = None
+    activeforcing_force_tolerance_n: float = 0.25
 
     # Ablation (short flag): tactile obs/model branch, but execute absolute 7D task-space actions.
     # - Env still expects 13D in tactile mode: pad force dims with zeros
@@ -813,6 +825,28 @@ def run_closed_loop_policy(  # noqa: C901
             lift_target_object = target_object
 
     client = _websocket_client_policy.WebsocketClientPolicy(args.server_host, args.server_port)
+    activeforcing_executor = ActiveForcingExecutor.from_env(
+        env,
+        enabled=bool(args.activeforcing_enabled),
+        force_tolerance_n=float(args.activeforcing_force_tolerance_n),
+    )
+    if args.activeforcing_enabled and args.control_mode not in ("hybrid", "tactile"):
+        raise ValueError("ActiveForcing requires control_mode='hybrid' or 'tactile'")
+    if args.activeforcing_enabled and args.abs7d:
+        raise ValueError("ActiveForcing cannot be combined with the abs7d force-ablation mode")
+    activeforcing_model = None
+    if args.activeforcing_enabled:
+        activeforcing_model = (
+            JsonTargetForceModel(args.activeforcing_decision_path)
+            if args.activeforcing_decision_path is not None
+            else ResponseTargetForceModel()
+        )
+        source = (
+            f"json={args.activeforcing_decision_path}"
+            if args.activeforcing_decision_path is not None
+            else "OpenPI response field target_force_n"
+        )
+        print(f"[ActiveForcing] enabled; scalar source: {source}")
     with contextlib.suppress(KeyboardInterrupt) and torch.inference_mode():
         for exp_idx in range(args.num_total_experiments):
             print(f"\n[{exp_idx + 1}/{args.num_total_experiments}] Starting experiment...", end=" ", flush=True)
@@ -862,6 +896,7 @@ def run_closed_loop_policy(  # noqa: C901
             # 当前 experiment 的 Hybrid 13D 动作缓存。
             exp_actions_13d: list[torch.Tensor] = []
             exp_step_trace_rows: list[dict] = []
+            exp_activeforcing_telemetry: list[dict] = []
 
             episode_video = (
                 EpisodeVideoWriter(video_output_dir, exp_idx, video_fps)
@@ -917,6 +952,8 @@ def run_closed_loop_policy(  # noqa: C901
             else:
                 # Fallback to default reset if no dataset file specified or doesn't exist
                 obs, info = env.reset()
+
+            activeforcing_executor.begin_episode()
 
             if lift_target_object is not None:
                 if lift_target_object not in env.unwrapped.scene.keys():
@@ -1093,6 +1130,17 @@ def run_closed_loop_policy(  # noqa: C901
                 #   - diffik/osc: first 7D   (x, y, z, rx, ry, rz, gripper)
                 #   - hybrid/tactile: first 13D (x, y, z, rx, ry, rz, gripper, fL(3), fR(3))
                 action_chunk = inference_response["actions"]
+                if args.activeforcing_enabled:
+                    activeforcing_model_output = activeforcing_model.predict_target_force_n(
+                        inference_response=inference_response,
+                        context={
+                            "task_suite": args.task_suite,
+                            "task_id": int(args.task_id),
+                            "experiment_index": int(exp_idx),
+                            "inference_chunk_index": int(action_idx),
+                        },
+                    )
+                    activeforcing_executor.consume_model_output(activeforcing_model_output)
                 assert len(action_chunk) >= args.replan_steps, (
                     f"We want to replan every {args.replan_steps} steps, but policy only predicts"
                     f" {len(action_chunk)} steps."
@@ -1187,6 +1235,7 @@ def run_closed_loop_policy(  # noqa: C901
                 # NOTE: We limit to the actual number of actions we have (might be less than replan_steps)
                 num_actions_to_execute = min(action.shape[0], args.replan_steps)
                 for i in range(num_actions_to_execute):
+                    activeforcing_executor.validate_action(action[i])
                     obs, reward, terminated, truncated, info = env.step(action[i].reshape([1, -1]))
                     tactile_buf.append_control_sample(
                         obs,
@@ -1555,6 +1604,9 @@ def run_closed_loop_policy(  # noqa: C901
                             contact_latched=step_override_latched,
                         )
 
+                    activeforcing_step_telemetry = activeforcing_executor.telemetry()
+                    exp_activeforcing_telemetry.append(activeforcing_step_telemetry)
+
                     total_steps_taken += 1
 
                     if args.step_trace_path is not None:
@@ -1592,6 +1644,7 @@ def run_closed_loop_policy(  # noqa: C901
                                 "gripper_open_limit_m": step_gripper_open_limit,
                                 "gripper_lower_saturated": step_gripper_lower_saturated,
                                 "gripper_upper_saturated": step_gripper_upper_saturated,
+                                **activeforcing_step_telemetry,
                                 **step_reward_force,
                                 **step_lift_state,
                             }
@@ -2036,6 +2089,7 @@ def run_closed_loop_policy(  # noqa: C901
                 **trajectory_force_summary,
                 "force_tracking": force_tracking_summary,
                 "force_override": force_override_summary,
+                "activeforcing": activeforcing_executor.summary(exp_activeforcing_telemetry),
                 "lift": lift_summary,
                 "video": video_summary,
                 "trace_status": trace_status,

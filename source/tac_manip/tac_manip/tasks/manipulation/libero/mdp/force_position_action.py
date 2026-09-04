@@ -87,6 +87,15 @@ class ForcePositionActionCfg(ActionTermCfg):
     squeeze_ff_k_load_z: float = 0.9
     squeeze_ff_contact_threshold: float = 1.0  # >0 时，仅当 f_sq_meas_raw >= threshold 才启用前馈
 
+    # Runtime Newton mode is opt-in and is activated through
+    # ``set_target_squeeze_force_n``. The defaults keep the recorded/native
+    # 13-D policy path unchanged.
+    newton_force_tolerance_n: float = 0.25
+    newton_contact_threshold_n: float = 0.1
+    newton_max_steps: int = 0  # 0 disables the diagnostic timeout
+    newton_saturation_epsilon_m: float = 1.0e-6
+    newton_max_gap_delta_m: float = 5.0e-4
+
     # 由 manager 使用的 ActionTerm 类型（提供一个非 MISSING 的默认值，后续在模块末尾覆盖）
     class_type: type[ActionTerm] = ActionTerm
 
@@ -217,6 +226,19 @@ class ForcePositionAction(ActionTerm):
         self._debug: dict[str, torch.Tensor] = {}
         self._last_d_cmd = torch.zeros(self.num_envs, device=self._device)
 
+        # Optional scalar Newton target at the native ActionTerm boundary.
+        # The existing squeeze feedback law remains the only gripper controller.
+        self._newton_target_force_n = torch.zeros(self.num_envs, device=self._device)
+        self._newton_target_active = torch.zeros(self.num_envs, dtype=torch.bool, device=self._device)
+        self._newton_step_count = torch.zeros(self.num_envs, dtype=torch.long, device=self._device)
+        self._newton_gap_correction = torch.zeros(self.num_envs, device=self._device)
+        self._force_status: dict[str, object] = {
+            "mode": "native_policy", "requested_force_n": None,
+            "measured_force_n": 0.0, "left_force_n": 0.0, "right_force_n": 0.0,
+            "converged": False, "feasible": True, "saturation": "NONE",
+            "bilateral_contact": False, "failure_reason": None,
+        }
+
     # --------------------------------------------------------------------- #
     # Properties
     # --------------------------------------------------------------------- #
@@ -254,6 +276,33 @@ class ForcePositionAction(ActionTerm):
         """最近一次计算得到的夹爪目标开合度 d_cmd（每 env 一个标量）."""
         return self._last_d_cmd
 
+    def set_target_squeeze_force_n(self, target_force_n: float) -> None:
+        """Enable native squeeze feedback with a scalar target in physical N."""
+        target = float(target_force_n)
+        if not torch.isfinite(torch.tensor(target)) or target < 0.0:
+            raise ValueError("target_force_n must be finite and non-negative")
+        self._newton_target_force_n.fill_(target)
+        self._newton_target_active.fill_(True)
+        self._newton_step_count.zero_()
+        self._newton_gap_correction.zero_()
+
+    def clear_target_squeeze_force_n(self) -> None:
+        """Return to the recorded/native 13-D force-target behavior."""
+        self._newton_target_active.fill_(False)
+        self._newton_target_force_n.zero_()
+        self._newton_step_count.zero_()
+        self._newton_gap_correction.zero_()
+        self._force_status = {
+            "mode": "native_policy", "requested_force_n": None,
+            "measured_force_n": 0.0, "left_force_n": 0.0, "right_force_n": 0.0,
+            "converged": False, "feasible": True, "saturation": "NONE",
+            "bilateral_contact": False, "failure_reason": None,
+        }
+
+    def get_force_status(self) -> dict[str, object]:
+        """Return latest Newton/feasibility diagnostics for environment zero."""
+        return dict(self._force_status)
+
     def reset(self, env_ids: Sequence[int] | slice | torch.Tensor | None = None) -> None:
         """Reset actions, filters, and target-contact latch state."""
 
@@ -270,6 +319,10 @@ class ForcePositionAction(ActionTerm):
         self._target_contact_force_norm[ids] = 0.0
         self._target_contact_activation_step[ids] = -1
         self._environment_step_count[ids] = 0
+        self._newton_target_force_n[ids] = 0.0
+        self._newton_target_active[ids] = False
+        self._newton_step_count[ids] = 0
+        self._newton_gap_correction[ids] = 0.0
         if self._target_contact_sensor is not None:
             self._target_contact_sensor.reset(ids)
         self._debug = {}
@@ -339,7 +392,7 @@ class ForcePositionAction(ActionTerm):
         self._raw_actions[:] = actions
         self._processed_actions[:] = actions
 
-        if self.cfg.target_contact_squeeze_enabled:
+        if self.cfg.target_contact_squeeze_enabled and not torch.any(self._newton_target_active):
             force_matrix_w = self._target_contact_sensor.data.force_matrix_w
             if force_matrix_w is None:
                 raise RuntimeError(
@@ -388,6 +441,7 @@ class ForcePositionAction(ActionTerm):
         self._gripper_abs_cmd[:] = actions[:, 6:7]
         self._fL_target_local[:] = actions[:, 7:10]
         self._fR_target_local[:] = actions[:, 10:13]
+        self._newton_step_count[self._newton_target_active] += 1
 
     def apply_actions(self):
         """在每个仿真步被调用：更新夹爪开合 + 调用内部 DiffIK。"""
@@ -417,8 +471,13 @@ class ForcePositionAction(ActionTerm):
         # 2) 基于 finger 局部系计算挤压力与「加持力」
         # ------------------------------
         f_sq_meas_raw, F_app_meas_local = self._split_squeeze_and_applied_from_lr_local(fL_meas_local, fR_meas_local)
-        f_sq_target, F_app_target_local = self._split_squeeze_and_applied_from_lr_local(
+        f_sq_target_native, F_app_target_local = self._split_squeeze_and_applied_from_lr_local(
             self._fL_target_local, self._fR_target_local
+        )
+        # Scalar Newton mode overrides only the native squeeze scalar. The
+        # original applied-force target is retained so the arm trajectory is unchanged.
+        f_sq_target = torch.where(
+            self._newton_target_active, self._newton_target_force_n, f_sq_target_native
         )
 
         # 可选：只对“实测挤压力标量”做 EMA，抑制 min() 切换导致的高频锯齿
@@ -435,7 +494,8 @@ class ForcePositionAction(ActionTerm):
 
         # squeeze 目标前馈补偿（用于防滑/随负载增压）：基于 applied force 的 z 轴净载荷
         f_sq_target_eff = f_sq_target
-        if self.cfg.squeeze_ff_k_load_z != 0.0:
+        # Exact Newton mode bypasses the optional native load/feed-forward boost.
+        if self.cfg.squeeze_ff_k_load_z != 0.0 and not torch.any(self._newton_target_active):
             if self.cfg.squeeze_ff_contact_threshold > 0.0:
                 enable_ff = f_sq_meas_raw >= float(self.cfg.squeeze_ff_contact_threshold)
             else:
@@ -447,7 +507,7 @@ class ForcePositionAction(ActionTerm):
         # 13 N per finger remains exactly 26 N in the controller's two-finger
         # squeeze convention.  The policy's x/y and net applied-force targets
         # remain untouched.
-        if self.cfg.target_contact_squeeze_enabled:
+        if self.cfg.target_contact_squeeze_enabled and not torch.any(self._newton_target_active):
             override_target = torch.full_like(
                 f_sq_target_eff,
                 2.0
@@ -495,7 +555,19 @@ class ForcePositionAction(ActionTerm):
                 d_cmd = torch.where(use_correction, d_cmd, d_pred)
             else:
                 # 无死区时，直接使用连续增量式
-                d_cmd = d_pred - self.cfg.squeeze_kp * delta_f_sq
+                delta_d = self.cfg.squeeze_kp * delta_f_sq
+                d_cmd = d_pred - delta_d
+
+            if torch.any(self._newton_target_active):
+                correction_delta = torch.clamp(
+                    -delta_d,
+                    -float(self.cfg.newton_max_gap_delta_m),
+                    float(self.cfg.newton_max_gap_delta_m),
+                )
+                self._newton_gap_correction += torch.where(
+                    self._newton_target_active, correction_delta, torch.zeros_like(correction_delta)
+                )
+                d_cmd = d_pred + self._newton_gap_correction
 
             # 简单饱和：使用 env.cfg 的 open/close 范围（如果有）
             d_min = torch.zeros_like(d_cmd)
@@ -519,6 +591,13 @@ class ForcePositionAction(ActionTerm):
 
             # 记录最近一次 d_cmd，供调试可视化使用
             self._last_d_cmd = d_cmd.detach().clone()
+
+        self._update_force_status(
+            fL_meas_local=fL_meas_local,
+            fR_meas_local=fR_meas_local,
+            f_sq_meas=f_sq_meas_raw,
+            d_cmd=d_cmd,
+        )
 
         # ------------------------------
         # 5) 构造内部 DiffIK 的动作并调用（绝对位姿）
@@ -625,6 +704,68 @@ class ForcePositionAction(ActionTerm):
             "eef_pos_delta": (pos_hybrid - self._eef_pos_cmd).detach().clone(),
         }
 
+
+    def _update_force_status(
+        self,
+        *,
+        fL_meas_local: torch.Tensor,
+        fR_meas_local: torch.Tensor,
+        f_sq_meas: torch.Tensor,
+        d_cmd: torch.Tensor,
+    ) -> None:
+        """Update Newton feasibility diagnostics without changing control law."""
+        if not bool(self._newton_target_active[0].item()):
+            self._force_status = {
+                "mode": "native_policy", "requested_force_n": None,
+                "measured_force_n": float(f_sq_meas[0].item()),
+                "left_force_n": float(abs(fL_meas_local[0, 2].item())),
+                "right_force_n": float(abs(fR_meas_local[0, 2].item())),
+                "converged": False, "feasible": True, "saturation": "NONE",
+                "bilateral_contact": False, "failure_reason": None,
+            }
+            return
+
+        target = float(self._newton_target_force_n[0].item())
+        measured = float(f_sq_meas[0].item())
+        tolerance = float(self.cfg.newton_force_tolerance_n)
+        contact_threshold = float(self.cfg.newton_contact_threshold_n)
+        left_norm = float(torch.linalg.vector_norm(fL_meas_local[0]).item())
+        right_norm = float(torch.linalg.vector_norm(fR_meas_local[0]).item())
+        left_z = float(abs(fL_meas_local[0, 2].item()))
+        right_z = float(abs(fR_meas_local[0, 2].item()))
+        bilateral = left_norm >= contact_threshold and right_norm >= contact_threshold
+        d_cmd_value = float(d_cmd[0].item())
+        d_max = float(getattr(self._env.cfg, "gripper_open_val", 0.04))
+        epsilon = float(self.cfg.newton_saturation_epsilon_m)
+        if d_cmd_value <= epsilon:
+            saturation = "MIN_GAP"
+        elif d_cmd_value >= d_max - epsilon:
+            saturation = "MAX_GAP"
+        else:
+            saturation = "NONE"
+
+        if target <= tolerance and abs(measured - target) <= tolerance:
+            status, feasible, converged, reason = "CONVERGED", True, True, None
+        elif not bilateral and target > tolerance:
+            status, feasible, converged, reason = "CONTACT_LOST", False, False, "CONTACT_LOST"
+        elif saturation == "MIN_GAP" and measured < target - tolerance:
+            status, feasible, converged, reason = "HIGH_FORCE_INFEASIBLE", False, False, "HIGH_FORCE_INFEASIBLE"
+        elif saturation == "MAX_GAP" and measured > target + tolerance:
+            status, feasible, converged, reason = "LOW_FORCE_INFEASIBLE", False, False, "LOW_FORCE_INFEASIBLE"
+        elif self.cfg.newton_max_steps > 0 and int(self._newton_step_count[0].item()) >= self.cfg.newton_max_steps:
+            status, feasible, converged, reason = "MAX_ITERATIONS", True, False, "MAX_ITERATIONS"
+        else:
+            status, feasible, converged, reason = "TRACKING", True, False, None
+
+        self._force_status = {
+            "mode": "newton", "status": status,
+            "requested_force_n": target, "measured_force_n": measured,
+            "left_force_n": left_z, "right_force_n": right_z,
+            "converged": converged, "feasible": feasible,
+            "saturation": saturation, "bilateral_contact": bilateral,
+            "failure_reason": reason,
+            "step_count": int(self._newton_step_count[0].item()),
+        }
 
 # 把 cfg 的 class_type 指回本 ActionTerm，供 manager 创建
 ForcePositionActionCfg.class_type = ForcePositionAction
