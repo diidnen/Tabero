@@ -51,6 +51,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_rollouts", type=int, default=70)
     parser.add_argument("--output", required=True)
     parser.add_argument("--seed", type=int, default=20260904)
+    parser.add_argument(
+        "--asset_root",
+        default=None,
+        help="Optional local or remote Isaac asset root used instead of the Kit cloud default.",
+    )
     AppLauncher.add_app_launcher_args(parser)
     return parser.parse_args()
 
@@ -425,6 +430,12 @@ def main() -> None:
     os.environ["TASK_SUITE"] = args.task_suite
     os.environ["TASK_ID"] = str(args.task_id)
     app = AppLauncher(args).app
+    if args.asset_root:
+        import carb
+
+        carb.settings.get_settings().set(
+            "/persistent/isaac/asset_root/cloud", args.asset_root.rstrip("/")
+        )
 
     import torch
     from isaaclab.utils.datasets import HDF5DatasetFileHandler

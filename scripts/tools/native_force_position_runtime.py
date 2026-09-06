@@ -26,6 +26,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--snapshot_step", type=int, default=60)
     p.add_argument("--scene_snapshot", default=None)
     p.add_argument("--output", required=True)
+    p.add_argument(
+        "--asset_root",
+        default=None,
+        help="Optional local or remote Isaac asset root used instead of the Kit cloud default.",
+    )
     AppLauncher.add_app_launcher_args(p)
     return p.parse_args()
 
@@ -94,6 +99,12 @@ def main() -> None:
     os.environ["TASK_SUITE"] = args.task_suite
     os.environ["TASK_ID"] = str(args.task_id)
     app = AppLauncher(args).app
+    if args.asset_root:
+        import carb
+
+        carb.settings.get_settings().set(
+            "/persistent/isaac/asset_root/cloud", args.asset_root.rstrip("/")
+        )
 
     import gymnasium as gym
     import torch
