@@ -98,13 +98,14 @@ def main() -> None:
     args = parse_args()
     os.environ["TASK_SUITE"] = args.task_suite
     os.environ["TASK_ID"] = str(args.task_id)
-    app = AppLauncher(args).app
     if args.asset_root:
-        import carb
-
-        carb.settings.get_settings().set(
-            "/persistent/isaac/asset_root/cloud", args.asset_root.rstrip("/")
+        asset_root_arg = (
+            "--/persistent/isaac/asset_root/cloud=" + args.asset_root.rstrip("/")
         )
+        args.kit_args = " ".join(
+            part for part in (getattr(args, "kit_args", None), asset_root_arg) if part
+        )
+    app = AppLauncher(args).app
 
     import gymnasium as gym
     import torch
